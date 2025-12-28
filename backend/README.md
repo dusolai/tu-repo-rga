@@ -1,4 +1,4 @@
-# Backend Cerebro Diego.
+# Backend Cerebro Diego
 
 Backend para sistema RAG con Google Gemini.
 
@@ -31,3 +31,4 @@ GEMINI_API_KEY=tu_clave npm start
 - Multer (manejo de archivos)
 
 - Google Generative AI SDK
+
