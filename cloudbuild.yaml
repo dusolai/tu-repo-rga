@@ -8,7 +8,7 @@ steps:
       - '-t'
       - 'gcr.io/$PROJECT_ID/backend-cerebro:latest'
       - '-f'
-      - 'backend/Dockerfile'
+      - './backend/Dockerfile'
       - './backend'
 
   # Paso 2: Subir la imagen al registro
