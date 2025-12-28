@@ -1,15 +1,31 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai"); // <--- VOLVEMOS AL SDK OFICIAL
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
-const pdf = require('pdf-parse');
+
+// --- CARGA SEGURA DE LIBRERÍAS ---
+let pdf = null;
+let GoogleGenerativeAI = null;
+let INSTALL_ERROR = null;
+
+try {
+  // Intentamos cargar las librerías nuevas
+  console.log("Cargando librerías...");
+  pdf = require('pdf-parse');
+  const genAIModule = require("@google/generative-ai");
+  GoogleGenerativeAI = genAIModule.GoogleGenerativeAI;
+  console.log("✅ Librerías cargadas correctamente.");
+} catch (error) {
+  // Si fallan, guardamos el error pero NO apagamos el servidor
+  console.error("❌ ERROR CRÍTICO FALTAN DEPENDENCIAS:", error.message);
+  INSTALL_ERROR = error.message;
+}
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// ALMACÉN EN MEMORIA (Volátil)
+// ALMACÉN EN MEMORIA
 const STORES = new Map();
 
 // MIDDLEWARES
@@ -30,230 +46,85 @@ const getApiKey = () => {
 
 // --- ENDPOINTS ---
 
-app.get('/', (req, res) => res.send('Backend SDK Oficial Online 🟢'));
+// RUTA DE DIAGNÓSTICO
+app.get('/', (req, res) => {
+  if (INSTALL_ERROR) {
+    res.status(500).send(`
+      <div style="font-family: sans-serif; padding: 20px; background: #ffebee; color: #c62828; border: 2px solid red;">
+        <h1>⚠️ ERROR DE INSTALACIÓN</h1>
+        <p>El servidor arrancó, pero faltan librerías.</p>
+        <p><strong>Error técnico:</strong> ${INSTALL_ERROR}</p>
+        <p><strong>Solución:</strong> Asegúrate de que 'backend/package.json' incluye 'pdf-parse' y '@google/generative-ai'.</p>
+      </div>
+    `);
+  } else {
+    res.send('<h1 style="color:green">Backend Online y Completo 🚀</h1><p>Todas las librerías cargadas.</p>');
+  }
+});
 
 // 1. CREAR STORE
 app.post('/create-store', (req, res) => {
   const name = req.body.name || req.body.displayName || "Cerebro"; 
   const storeId = `store-${Date.now()}`;
   STORES.set(storeId, { name, texts: [] });
-  console.log(`✅ Store creado: ${storeId}`);
   res.json({ name: storeId }); 
 });
 
-// 2. UPLOAD (Igual que antes, esto ya funcionaba bien)
+// 2. UPLOAD
 app.post('/upload', upload.single('file'), async (req, res) => {
+  // Verificación de seguridad
+  if (INSTALL_ERROR) return res.status(500).json({ error: "Faltan librerías en el servidor. Revisa la página de inicio." });
+
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
-
-    console.log(`📥 Procesando: ${req.file.originalname}`);
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
 
     if (req.file.mimetype === 'application/pdf' || req.file.originalname.endsWith('.pdf')) {
-      try {
-          const data = await pdf(buffer);
-          extractedText = data.text;
-      } catch (e) {
-          console.error("Error PDF:", e);
-          extractedText = "Error leyendo PDF.";
-      }
+      if (!pdf) throw new Error("Librería PDF no cargada");
+      const data = await pdf(buffer);
+      extractedText = data.text;
     } else {
       extractedText = buffer.toString('utf-8');
     }
 
-    // Limpieza
-    extractedText = extractedText.replace(/\s+/g, ' ').trim().substring(0, 100000); // 100k chars
+    extractedText = extractedText.replace(/\s+/g, ' ').trim().substring(0, 100000);
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); 
 
-    res.json({
-      file: {
-        uri: `memory://${req.file.originalname}`,
-        extractedText: extractedText
-      }
-    });
-
+    res.json({ file: { uri: `memory://${req.file.originalname}`, extractedText } });
   } catch (error) {
-    console.error('❌ Error Upload:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// 3. VINCULAR (Auto-Curativo)
+// 3. VINCULAR
 app.post('/link-file', (req, res) => {
   const { storeId, fileName, extractedText } = req.body;
-  
-  if (!STORES.has(storeId)) {
-      console.warn(`⚠️ Recuperando Store ${storeId}...`);
-      STORES.set(storeId, { name: "Recuperado", texts: [] });
-  }
-  
+  if (!STORES.has(storeId)) STORES.set(storeId, { name: "Recuperado", texts: [] });
   const store = STORES.get(storeId);
   store.texts.push({ fileName, text: extractedText });
-  console.log(`🔗 Guardado: ${fileName} (${store.texts.length} docs)`);
-  res.json({ success: true, filesInStore: store.texts.length });
-});
-
-// 4. CHAT (CON SDK OFICIAL - ROBUSTO)
-app.post('/chat', async (req, res) => {
-  const { storeId, query } = req.body;
-  
-  if (!STORES.has(storeId)) {
-      return res.json({ text: "⚠️ Reinicio del servidor. Por favor sube los documentos de nuevo." });
-  }
-
-  const store = STORES.get(storeId);
-  const context = store.texts.map(t => `--- DOCUMENTO: ${t.fileName} ---\n${t.text}`).join('\n\n');
-  
-  const prompt = `
-  Eres un asistente experto. Responde usando SOLO este contexto.
-  
-  CONTEXTO:
-  ${context}
-  
-  PREGUNTA: ${query}
-  `;
-
-  try {
-    // USAMOS EL SDK OFICIAL (Mucho más estable que la llamada manual)
-    const genAI = new GoogleGenerativeAI(getApiKey());
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
-    
-    res.json({ text });
-  } catch (e) {
-    console.error("❌ Error Chat SDK:", e);
-    // Devolvemos el mensaje de error real para verlo en el frontend
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.listen(PORT, () => console.log(`🚀 Servidor SDK listo en ${PORT}`));
-    const options = {
-      hostname: 'generativelanguage.googleapis.com',
-      path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-            console.error("Gemini Error:", data);
-            return reject(new Error(`Error Gemini: ${res.statusCode}`));
-        }
-        try {
-          const parsed = JSON.parse(data);
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "Sin respuesta";
-          resolve(text);
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.write(payload);
-    req.end();
-  });
-}
-
-// --- ENDPOINTS ---
-
-app.get('/', (req, res) => res.send('Backend Auto-Curativo Online 🟢'));
-
-// 1. CREAR STORE
-app.post('/create-store', (req, res) => {
-  const name = req.body.name || req.body.displayName || "Cerebro"; 
-  const storeId = `store-${Date.now()}`;
-  STORES.set(storeId, { name, texts: [] });
-  console.log(`✅ Store creado: ${storeId}`);
-  res.json({ name: storeId }); 
-});
-
-// 2. UPLOAD (Extracción de texto)
-app.post('/upload', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file' });
-
-    console.log(`📥 Procesando: ${req.file.originalname}`);
-    const buffer = fs.readFileSync(req.file.path);
-    let extractedText = "";
-
-    if (req.file.mimetype === 'application/pdf' || req.file.originalname.endsWith('.pdf')) {
-      try {
-          const data = await pdf(buffer);
-          extractedText = data.text;
-      } catch (e) {
-          console.error("Error leyendo PDF:", e);
-          extractedText = "[Error leyendo PDF]";
-      }
-    } else {
-      extractedText = buffer.toString('utf-8');
-    }
-
-    // Limpieza
-    extractedText = extractedText.replace(/\s+/g, ' ').trim().substring(0, 50000); 
-    fs.unlinkSync(req.file.path); 
-
-    res.json({
-      file: {
-        uri: `memory://${req.file.originalname}`,
-        extractedText: extractedText
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error Upload:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 3. VINCULAR (AQUÍ ESTÁ EL ARREGLO)
-app.post('/link-file', (req, res) => {
-  const { storeId, fileName, extractedText } = req.body;
-  
-  // === AUTO-CURACIÓN ===
-  // Si el servidor se reinició y perdió el store, lo creamos al vuelo
-  if (!STORES.has(storeId)) {
-      console.warn(`⚠️ Store ${storeId} perdido (reinicio). Re-creándolo...`);
-      STORES.set(storeId, { name: "Recuperado", texts: [] });
-  }
-  
-  const store = STORES.get(storeId);
-  store.texts.push({ fileName, text: extractedText });
-  
-  console.log(`🔗 ${fileName} guardado. Docs totales: ${store.texts.length}`);
   res.json({ success: true, filesInStore: store.texts.length });
 });
 
 // 4. CHAT
 app.post('/chat', async (req, res) => {
-  const { storeId, query } = req.body;
+  if (INSTALL_ERROR) return res.status(500).json({ error: "Faltan librerías (SDK). Mira la raíz del servidor." });
   
-  // Si se perdió el store en el chat, avisamos amablemente
-  if (!STORES.has(storeId)) {
-      return res.json({ text: "⚠️ He perdido la memoria por un reinicio del servidor. Por favor, recarga la página y sube los archivos de nuevo." });
-  }
+  const { storeId, query } = req.body;
+  if (!STORES.has(storeId)) return res.json({ text: "⚠️ Servidor reiniciado. Sube los archivos de nuevo." });
 
   const store = STORES.get(storeId);
-  
-  if (store.texts.length === 0) {
-      return res.json({ text: "No tengo documentos cargados para responder esa pregunta." });
-  }
-
   const context = store.texts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
-  const prompt = `Responde usando SOLO este contexto:\n${context}\n\nPregunta: ${query}`;
+  const prompt = `Contexto:\n${context}\n\nPregunta: ${query}`;
 
   try {
-    const apiKey = getApiKey();
-    const answer = await callGeminiREST(prompt, apiKey);
-    res.json({ text: answer });
+    const genAI = new GoogleGenerativeAI(getApiKey());
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const result = await model.generateContent(prompt);
+    res.json({ text: result.response.text() });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor (Modo Seguro) listo en ${PORT}`));
