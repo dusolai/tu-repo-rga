@@ -131,26 +131,39 @@ app.post('/create-store', (req, res) => {
   }
 });
 
-// Subir archivo
+// Subir archivo (acepta multipart/form-data)
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    console.log(`📤 Subiendo archivo: ${req.file?.originalname}`);
+    if (!req.file) {
+      console.error('❌ No file in request');
+      return res.status(400).json({ error: 'No file found in request' });
+    }
+
+    console.log(`📤 Subiendo archivo: ${req.file.originalname}`);
+    console.log(`   Tamaño: ${req.file.size} bytes`);
     
     const apiKey = getApiKey();
-    const { path: localPath, originalname } = req.file;
+    const { path: localPath, originalname, mimetype } = req.file;
+    
+    // Leer archivo
     const fileContent = fs.readFileSync(localPath);
-    const contentType = originalname.endsWith('.pdf') ? 'application/pdf' : 'text/plain';
+    console.log(`   Archivo leído: ${fileContent.length} bytes`);
+    
+    // Determinar tipo de contenido
+    const contentType = mimetype || (originalname.endsWith('.pdf') ? 'application/pdf' : 'text/plain');
 
     // Subir a Gemini File Manager
     const boundary = `----Boundary${Date.now()}`;
     const metadata = JSON.stringify({ file: { displayName: originalname } });
     
     const body = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Type: application/json\r\n\r\n${metadata}\r\n`),
+      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n${metadata}\r\n`),
       Buffer.from(`--${boundary}\r\nContent-Type: ${contentType}\r\n\r\n`),
       fileContent,
       Buffer.from(`\r\n--${boundary}--\r\n`)
     ]);
+
+    console.log(`   Subiendo a Gemini File Manager...`);
 
     const uploadResult = await new Promise((resolve, reject) => {
       const options = {
@@ -163,31 +176,50 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         }
       };
 
-      const req = https.request(options, (res) => {
+      const uploadReq = https.request(options, (uploadRes) => {
         let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          if (res.statusCode === 200) resolve(JSON.parse(data));
-          else reject(new Error(`Upload failed: ${data}`));
+        uploadRes.on('data', chunk => data += chunk);
+        uploadRes.on('end', () => {
+          console.log(`   Upload HTTP Status: ${uploadRes.statusCode}`);
+          if (uploadRes.statusCode === 200) {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              console.error(`   ❌ Parse error:`, data.substring(0, 200));
+              reject(new Error('Failed to parse upload response'));
+            }
+          } else {
+            console.error(`   ❌ Upload failed:`, data.substring(0, 200));
+            reject(new Error(`Upload failed: HTTP ${uploadRes.statusCode}`));
+          }
         });
       });
 
-      req.on('error', reject);
-      req.write(body);
-      req.end();
+      uploadReq.on('error', (e) => {
+        console.error(`   ❌ Request error:`, e.message);
+        reject(e);
+      });
+      
+      uploadReq.write(body);
+      uploadReq.end();
     });
 
     // Extraer texto
     let extractedText = '';
     if (originalname.endsWith('.txt') || originalname.endsWith('.md')) {
       extractedText = fileContent.toString('utf-8');
+      console.log(`   Texto extraído (TXT): ${extractedText.length} chars`);
     } else if (originalname.endsWith('.pdf')) {
-      extractedText = `[PDF: ${originalname} - texto no extraído]`;
+      extractedText = `[PDF: ${originalname}]`;
+      console.log(`   PDF detectado (sin extracción)`);
+    } else {
+      extractedText = fileContent.toString('utf-8');
+      console.log(`   Texto extraído (genérico): ${extractedText.length} chars`);
     }
 
-    console.log(`✅ Archivo subido: ${uploadResult.file.name}`);
-    console.log(`   Texto extraído: ${extractedText.length} chars`);
+    console.log(`✅ Archivo subido a Gemini: ${uploadResult.file.name}`);
 
+    // Limpiar archivo temporal
     fs.unlinkSync(localPath);
 
     res.json({
@@ -199,7 +231,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ Error upload:', error);
+    console.error('❌ Error en upload:', error.message);
+    console.error('   Stack:', error.stack);
     res.status(500).json({ error: error.message });
   }
 });
