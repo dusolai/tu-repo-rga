@@ -9,11 +9,8 @@ const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 const STORES = new Map();
 
-// ===========================
 // MIDDLEWARES
-// ===========================
 app.use(express.json());
-
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -28,15 +25,11 @@ const getApiKey = () => {
   return key;
 };
 
-// ===========================
-// GEMINI REST API (SIN SDK)
-// ===========================
+// GEMINI REST API
 function callGeminiREST(prompt, apiKey) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({
-      contents: [{
-        parts: [{ text: prompt }]
-      }]
+      contents: [{ parts: [{ text: prompt }] }]
     });
 
     const options = {
@@ -50,71 +43,42 @@ function callGeminiREST(prompt, apiKey) {
       }
     };
 
-    console.log(`📡 Llamando a Gemini REST API...`);
-    console.log(`   Path: ${options.path}`);
-
     const req = https.request(options, (res) => {
-      let responseData = '';
-      res.on('data', (chunk) => { responseData += chunk; });
+      let data = '';
+      res.on('data', c => data += c);
       res.on('end', () => {
-        console.log(`   HTTP Status: ${res.statusCode}`);
-        
         if (res.statusCode !== 200) {
-          console.error(`   ❌ Error HTTP ${res.statusCode}:`, responseData);
-          reject(new Error(`HTTP ${res.statusCode}: ${responseData}`));
-          return;
+          console.error(`❌ Gemini HTTP ${res.statusCode}:`, data.substring(0, 200));
+          return reject(new Error(`HTTP ${res.statusCode}`));
         }
-
         try {
-          const parsed = JSON.parse(responseData);
-          
-          if (parsed.error) {
-            console.error(`   ❌ Gemini Error:`, JSON.stringify(parsed.error));
-            reject(new Error(`Gemini: ${parsed.error.message}`));
-            return;
-          }
-
+          const parsed = JSON.parse(data);
+          if (parsed.error) return reject(new Error(parsed.error.message));
           if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
-            const text = parsed.candidates[0].content.parts[0].text;
-            console.log(`   ✅ Respuesta OK: ${text.length} chars`);
-            resolve(text);
-          } else {
-            console.error(`   ❌ Formato inesperado:`, JSON.stringify(parsed).substring(0, 200));
-            reject(new Error('Respuesta sin texto'));
+            return resolve(parsed.candidates[0].content.parts[0].text);
           }
+          reject(new Error('Sin respuesta'));
         } catch (e) {
-          console.error(`   ❌ Parse Error:`, e.message);
-          console.error(`   Raw:`, responseData.substring(0, 500));
-          reject(new Error(`Parse error: ${e.message}`));
+          reject(new Error('Parse error'));
         }
       });
     });
-
-    req.on('error', (e) => {
-      console.error(`   ❌ Request Error:`, e.message);
-      reject(e);
-    });
-
+    req.on('error', reject);
     req.write(payload);
     req.end();
   });
 }
 
-// ===========================
 // ENDPOINTS
-// ===========================
 
-// Health check
 app.get('/', (req, res) => {
-  console.log('💚 Health check');
   res.json({ 
     status: 'ok', 
-    version: '7.0.0-REST-PURO',
-    modelo: 'gemini-1.5-flash (REST v1beta)'
+    version: '8.0.0',
+    modelo: 'gemini-1.5-flash v1beta'
   });
 });
 
-// Crear store
 app.post('/create-store', (req, res) => {
   try {
     const { name } = req.body;
@@ -123,103 +87,113 @@ app.post('/create-store', (req, res) => {
     const storeId = `fileSearchStores/${name}${Date.now()}-${Math.random().toString(36).slice(2)}`;
     STORES.set(storeId, { name, files: [], texts: [] });
 
-    console.log(`✅ Store creado: ${storeId}`);
+    console.log(`✅ Store: ${storeId}`);
     res.json({ storeId });
   } catch (error) {
-    console.error('❌ Error creando store:', error);
+    console.error('❌ Error store:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Subir archivo (acepta multipart/form-data)
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
-      console.error('❌ No file in request');
-      return res.status(400).json({ error: 'No file found in request' });
+      return res.status(400).json({ error: 'No file' });
     }
 
-    console.log(`📤 Subiendo archivo: ${req.file.originalname}`);
-    console.log(`   Tamaño: ${req.file.size} bytes`);
+    const { originalname, path: localPath, mimetype } = req.file;
+    console.log(`📤 Upload: ${originalname} (${req.file.size}b)`);
     
     const apiKey = getApiKey();
-    const { path: localPath, originalname, mimetype } = req.file;
-    
-    // Leer archivo
     const fileContent = fs.readFileSync(localPath);
-    console.log(`   Archivo leído: ${fileContent.length} bytes`);
     
-    // Determinar tipo de contenido
-    const contentType = mimetype || (originalname.endsWith('.pdf') ? 'application/pdf' : 'text/plain');
-
-    // Subir a Gemini File Manager
-    const boundary = `----Boundary${Date.now()}`;
-    const metadata = JSON.stringify({ file: { displayName: originalname } });
+    // Tipo MIME
+    let contentType = mimetype || 'text/plain';
+    if (originalname.endsWith('.pdf')) contentType = 'application/pdf';
+    else if (originalname.endsWith('.md')) contentType = 'text/markdown';
+    
+    // === MULTIPART FORM-DATA CORRECTO ===
+    const boundary = `----FormBoundary${Date.now()}`;
+    
+    const metadataPart = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="metadata"`,
+      `Content-Type: application/json; charset=UTF-8`,
+      ``,
+      JSON.stringify({ file: { display_name: originalname } }),
+      ``
+    ].join('\r\n');
+    
+    const filePart = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="file"; filename="${originalname}"`,
+      `Content-Type: ${contentType}`,
+      ``,
+      ``
+    ].join('\r\n');
+    
+    const ending = `\r\n--${boundary}--\r\n`;
     
     const body = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n${metadata}\r\n`),
-      Buffer.from(`--${boundary}\r\nContent-Type: ${contentType}\r\n\r\n`),
+      Buffer.from(metadataPart, 'utf8'),
+      Buffer.from(filePart, 'utf8'),
       fileContent,
-      Buffer.from(`\r\n--${boundary}--\r\n`)
+      Buffer.from(ending, 'utf8')
     ]);
 
-    console.log(`   Subiendo a Gemini File Manager...`);
+    console.log(`   Multipart size: ${body.length}b`);
 
+    // UPLOAD A GEMINI
     const uploadResult = await new Promise((resolve, reject) => {
-      const options = {
+      const opts = {
         hostname: 'generativelanguage.googleapis.com',
         path: `/upload/v1beta/files?key=${apiKey}`,
         method: 'POST',
         headers: {
-          'Content-Type': `multipart/related; boundary=${boundary}`,
-          'Content-Length': body.length
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': body.length,
+          'X-Goog-Upload-Protocol': 'multipart'
         }
       };
 
-      const uploadReq = https.request(options, (uploadRes) => {
+      const uploadReq = https.request(opts, (uploadRes) => {
         let data = '';
-        uploadRes.on('data', chunk => data += chunk);
+        uploadRes.on('data', c => data += c);
         uploadRes.on('end', () => {
-          console.log(`   Upload HTTP Status: ${uploadRes.statusCode}`);
+          console.log(`   HTTP ${uploadRes.statusCode}`);
           if (uploadRes.statusCode === 200) {
             try {
               resolve(JSON.parse(data));
             } catch (e) {
-              console.error(`   ❌ Parse error:`, data.substring(0, 200));
-              reject(new Error('Failed to parse upload response'));
+              console.error(`   Parse fail:`, data.substring(0, 200));
+              reject(new Error('Parse error'));
             }
           } else {
-            console.error(`   ❌ Upload failed:`, data.substring(0, 200));
-            reject(new Error(`Upload failed: HTTP ${uploadRes.statusCode}`));
+            console.error(`   Fail:`, data.substring(0, 300));
+            reject(new Error(`HTTP ${uploadRes.statusCode}`));
           }
         });
       });
-
-      uploadReq.on('error', (e) => {
-        console.error(`   ❌ Request error:`, e.message);
-        reject(e);
-      });
-      
+      uploadReq.on('error', reject);
       uploadReq.write(body);
       uploadReq.end();
     });
 
-    // Extraer texto
+    // EXTRAER TEXTO
     let extractedText = '';
     if (originalname.endsWith('.txt') || originalname.endsWith('.md')) {
       extractedText = fileContent.toString('utf-8');
-      console.log(`   Texto extraído (TXT): ${extractedText.length} chars`);
     } else if (originalname.endsWith('.pdf')) {
       extractedText = `[PDF: ${originalname}]`;
-      console.log(`   PDF detectado (sin extracción)`);
     } else {
-      extractedText = fileContent.toString('utf-8');
-      console.log(`   Texto extraído (genérico): ${extractedText.length} chars`);
+      try {
+        extractedText = fileContent.toString('utf-8');
+      } catch {
+        extractedText = `[Binary: ${originalname}]`;
+      }
     }
 
-    console.log(`✅ Archivo subido a Gemini: ${uploadResult.file.name}`);
-
-    // Limpiar archivo temporal
+    console.log(`✅ OK: ${uploadResult.file.name} (${extractedText.length}c)`);
     fs.unlinkSync(localPath);
 
     res.json({
@@ -231,19 +205,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ Error en upload:', error.message);
-    console.error('   Stack:', error.stack);
+    console.error('❌ Upload error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Vincular archivo
 app.post('/link-file', (req, res) => {
   try {
     const { storeId, fileUri, fileName, extractedText } = req.body;
     
-    console.log(`🔗 Vinculando archivo a store: ${storeId}`);
-
     if (!STORES.has(storeId)) {
       return res.status(404).json({ error: 'Store no encontrado' });
     }
@@ -253,53 +223,47 @@ app.post('/link-file', (req, res) => {
     
     if (extractedText) {
       store.texts.push({ fileName, text: extractedText });
-      console.log(`   Texto guardado: ${extractedText.length} chars`);
     }
 
-    console.log(`✅ Total archivos: ${store.files.length}`);
+    console.log(`🔗 Linked: ${fileName} (${store.files.length} total)`);
     res.json({ success: true, fileCount: store.files.length });
   } catch (error) {
-    console.error('❌ Error linking:', error);
+    console.error('❌ Link error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Chat con RAG
 app.post('/chat', async (req, res) => {
   try {
     const { storeId, query } = req.body;
     const apiKey = getApiKey();
 
-    console.log(`💬 Query: "${query}"`);
-    console.log(`   Store: ${storeId}`);
+    console.log(`💬 "${query}" @ ${storeId}`);
 
     if (!STORES.has(storeId)) {
       return res.status(404).json({ error: 'Store no encontrado' });
     }
 
     const store = STORES.get(storeId);
-    console.log(`🔍 Textos disponibles: ${store.texts.length}`);
+    console.log(`🔍 ${store.texts.length} docs`);
 
-    // Construir contexto
     let context = '';
     for (const { fileName, text } of store.texts) {
       context += `\n\n--- ${fileName} ---\n${text}`;
     }
 
     const prompt = `Documentos:\n${context}\n\nPregunta: ${query}\n\nResponde SOLO con información de los documentos.`;
-    console.log(`   Prompt: ${prompt.length} chars`);
 
     const response = await callGeminiREST(prompt, apiKey);
 
-    console.log(`✅ Respuesta generada`);
+    console.log(`✅ Respuesta: ${response.length}c`);
     res.json({ response });
   } catch (error) {
-    console.error('❌ Error en chat:', error.message);
+    console.error('❌ Chat error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Debug
 app.get('/debug/stores', (req, res) => {
   const stores = Array.from(STORES.entries()).map(([id, data]) => ({
     id,
@@ -310,11 +274,7 @@ app.get('/debug/stores', (req, res) => {
   res.json({ stores });
 });
 
-// ===========================
-// SERVIDOR
-// ===========================
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v7.0.0 escuchando en puerto ${PORT}`);
-  console.log(`   Modelo: gemini-1.5-flash (REST v1beta)`);
-  console.log(`   Sin SDK - REST API pura`);
+  console.log(`🚀 Backend v8.0.0 @ ${PORT}`);
+  console.log(`   gemini-1.5-flash REST v1beta`);
 });
