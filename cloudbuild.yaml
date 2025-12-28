@@ -1,0 +1,45 @@
+steps:
+  # Paso 1: Construir la imagen Docker
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/backend-cerebro:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/backend-cerebro:latest'
+      - '-f'
+      - 'backend/Dockerfile'
+      - './backend'
+
+  # Paso 2: Subir la imagen al registro
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/backend-cerebro:$COMMIT_SHA'
+
+  # Paso 3: Desplegar en Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'backend-cerebro'
+      - '--image=gcr.io/$PROJECT_ID/backend-cerebro:$COMMIT_SHA'
+      - '--region=europe-southwest1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--set-env-vars=GEMINI_API_KEY=${_GEMINI_API_KEY}'
+
+# Configuración de imágenes a mantener
+images:
+  - 'gcr.io/$PROJECT_ID/backend-cerebro:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/backend-cerebro:latest'
+
+# Sustituciones (variables que necesitas configurar)
+substitutions:
+  _GEMINI_API_KEY: 'PLACEHOLDER'  # Configura esto en Cloud Build
+
+# Opciones de timeout
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
