@@ -1,7 +1,7 @@
 {
   "name": "backend-cerebro-final",
-  "version": "4.1.0",
-  "description": "Backend RAG con SDK Oficial",
+  "version": "4.2.0",
+  "description": "Backend RAG Oficial",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
