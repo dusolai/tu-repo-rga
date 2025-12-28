@@ -1,24 +1,20 @@
-# Imagen base oficial de Node.js
-FROM node:18-slim
+# Usamos una imagen ligera de Node.js
+FROM node:20-slim
 
-# Directorio de trabajo
-WORKDIR /app
+# Creamos el directorio de trabajo
+WORKDIR /usr/src/app
 
-# Copiar package files
+# Copiamos primero los archivos de dependencias
 COPY package*.json ./
 
-# Instalar dependencias de producción
-RUN npm install --omit=dev
+# Instalamos solo lo necesario para producción
+RUN npm install --only=production
 
-# Copiar el código
-COPY index.js ./
+# Copiamos el resto del código
+COPY . .
 
-# Exponer el puerto (Cloud Run lo asigna dinámicamente)
+# Exponemos el puerto 8080
 EXPOSE 8080
 
-# Variables de entorno por defecto
-ENV PORT=8080
-ENV NODE_ENV=production
-
-# Comando de inicio
-CMD ["node", "index.js"]
+# Comando para arrancar el servidor
+CMD [ "npm", "start" ]
