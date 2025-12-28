@@ -3,16 +3,17 @@ const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
-const pdf = require('pdf-parse'); // <--- NUEVO: Para leer PDFs
+const pdf = require('pdf-parse'); 
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
-// ALMACÉN EN MEMORIA (Ojo: Se borra si reinicias Cloud Run)
+
+// ALMACÉN EN MEMORIA (Volátil)
 const STORES = new Map();
 
 // MIDDLEWARES
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Aumentamos límite para textos largos
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -27,7 +28,7 @@ const getApiKey = () => {
   return key;
 };
 
-// --- FUNCIÓN HELPER: Llamada a Gemini ---
+// HELPER: Llamada a Gemini
 function callGeminiREST(prompt, apiKey) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({
@@ -46,8 +47,8 @@ function callGeminiREST(prompt, apiKey) {
       res.on('data', c => data += c);
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          console.error(`Gemini Error ${res.statusCode}:`, data);
-          return reject(new Error(`Error Gemini: ${res.statusCode}`));
+            console.error("Gemini Error:", data);
+            return reject(new Error(`Error Gemini: ${res.statusCode}`));
         }
         try {
           const parsed = JSON.parse(data);
@@ -64,20 +65,18 @@ function callGeminiREST(prompt, apiKey) {
 
 // --- ENDPOINTS ---
 
-app.get('/', (req, res) => res.send('Backend RAG Online 🚀'));
+app.get('/', (req, res) => res.send('Backend Auto-Curativo Online 🟢'));
 
 // 1. CREAR STORE
 app.post('/create-store', (req, res) => {
-  // Frontend envía displayName, Backend acepta ambos
-  const name = req.body.name || req.body.displayName; 
+  const name = req.body.name || req.body.displayName || "Cerebro"; 
   const storeId = `store-${Date.now()}`;
   STORES.set(storeId, { name, texts: [] });
   console.log(`✅ Store creado: ${storeId}`);
-  // Devolvemos "name" porque el frontend lo espera así
   res.json({ name: storeId }); 
 });
 
-// 2. UPLOAD (PROCESAMIENTO REAL)
+// 2. UPLOAD (Extracción de texto)
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
@@ -86,21 +85,22 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
 
-    // LÓGICA DE EXTRACCIÓN
     if (req.file.mimetype === 'application/pdf' || req.file.originalname.endsWith('.pdf')) {
-      const data = await pdf(buffer);
-      extractedText = data.text; // <--- AQUÍ ESTÁ LA MAGIA
+      try {
+          const data = await pdf(buffer);
+          extractedText = data.text;
+      } catch (e) {
+          console.error("Error leyendo PDF:", e);
+          extractedText = "[Error leyendo PDF]";
+      }
     } else {
       extractedText = buffer.toString('utf-8');
     }
 
-    // Limpieza básica del texto
-    extractedText = extractedText.replace(/\s+/g, ' ').trim().substring(0, 30000); // Límite de seguridad
+    // Limpieza
+    extractedText = extractedText.replace(/\s+/g, ' ').trim().substring(0, 50000); 
+    fs.unlinkSync(req.file.path); 
 
-    console.log(`📄 Texto extraído: ${extractedText.length} caracteres`);
-    fs.unlinkSync(req.file.path); // Borrar temporal
-
-    // Devolvemos el texto al frontend para que él decida qué hacer (o lo guardamos aquí si prefieres)
     res.json({
       file: {
         uri: `memory://${req.file.originalname}`,
@@ -114,47 +114,49 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// 3. VINCULAR (GUARDAR EN MEMORIA)
+// 3. VINCULAR (AQUÍ ESTÁ EL ARREGLO)
 app.post('/link-file', (req, res) => {
   const { storeId, fileName, extractedText } = req.body;
   
-  if (!STORES.has(storeId)) return res.status(404).json({ error: 'Store no existe' });
+  // === AUTO-CURACIÓN ===
+  // Si el servidor se reinició y perdió el store, lo creamos al vuelo
+  if (!STORES.has(storeId)) {
+      console.warn(`⚠️ Store ${storeId} perdido (reinicio). Re-creándolo...`);
+      STORES.set(storeId, { name: "Recuperado", texts: [] });
+  }
   
   const store = STORES.get(storeId);
-  // Guardamos el texto REAL en memoria
   store.texts.push({ fileName, text: extractedText });
   
-  console.log(`🔗 ${fileName} guardado en ${storeId}. Total docs: ${store.texts.length}`);
+  console.log(`🔗 ${fileName} guardado. Docs totales: ${store.texts.length}`);
   res.json({ success: true, filesInStore: store.texts.length });
 });
 
-// 4. CHAT (RAG)
+// 4. CHAT
 app.post('/chat', async (req, res) => {
   const { storeId, query } = req.body;
-  if (!STORES.has(storeId)) return res.status(404).json({ error: 'Store perdido (Reinicia la web)' });
+  
+  // Si se perdió el store en el chat, avisamos amablemente
+  if (!STORES.has(storeId)) {
+      return res.json({ text: "⚠️ He perdido la memoria por un reinicio del servidor. Por favor, recarga la página y sube los archivos de nuevo." });
+  }
 
   const store = STORES.get(storeId);
   
-  // CONSTRUIMOS EL CONTEXTO CON EL TEXTO REAL
-  const context = store.texts.map(t => `--- DOCUMENTO: ${t.fileName} ---\n${t.text}`).join('\n\n');
-  
-  const prompt = `
-  Eres un asistente experto. Usa SOLO la siguiente información para responder.
-  
-  INFORMACIÓN DISPONIBLE:
-  ${context}
-  
-  PREGUNTA DEL USUARIO: ${query}
-  `;
+  if (store.texts.length === 0) {
+      return res.json({ text: "No tengo documentos cargados para responder esa pregunta." });
+  }
+
+  const context = store.texts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
+  const prompt = `Responde usando SOLO este contexto:\n${context}\n\nPregunta: ${query}`;
 
   try {
     const apiKey = getApiKey();
     const answer = await callGeminiREST(prompt, apiKey);
-    // IMPORTANTE: Devolver "text" para que coincida con tu frontend actual
     res.json({ text: answer });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor listo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor listo en ${PORT}`));
