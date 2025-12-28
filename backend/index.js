@@ -183,33 +183,60 @@ app.post('/chat', async (req, res) => {
     const { query, storeId } = req.body;
     if (!query) return res.status(400).json({ error: "Falta query" });
     
-    console.log(`💬 "${query}"`);
+    console.log(`💬 Query recibida: "${query}"`);
+    console.log(`   Store ID: ${storeId || 'N/A'}`);
+    
     const apiKey = getApiKey();
+    console.log(`   API Key presente: ${apiKey ? 'SÍ' : 'NO'}`);
     
     if (storeId && STORES.has(storeId)) {
       const store = STORES.get(storeId);
+      console.log(`   Store encontrado: ${store.displayName}`);
+      console.log(`   Textos disponibles: ${store.texts?.length || 0}`);
       
       if (store.texts && store.texts.length > 0) {
-        console.log(`🔍 RAG con ${store.texts.length} docs`);
+        console.log(`🔍 Iniciando RAG con ${store.texts.length} documentos`);
         
-        const context = store.texts.map((t, i) => 
-          `--- DOC ${i + 1}: ${t.fileName} ---\n${t.content}\n`
-        ).join('\n');
+        const context = store.texts.map((t, i) => {
+          console.log(`   - Doc ${i + 1}: ${t.fileName} (${t.content.length} chars)`);
+          return `--- DOC ${i + 1}: ${t.fileName} ---\n${t.content}\n`;
+        }).join('\n');
         
         const fullPrompt = `Documentos:\n${context}\n\nPregunta: ${query}\n\nResponde SOLO con info de los documentos.`;
-        const responseText = await callGeminiREST(fullPrompt, apiKey);
+        console.log(`   Prompt generado: ${fullPrompt.length} chars`);
         
-        console.log(`✅ RAG OK (${responseText.length} chars)`);
-        return res.json({ text: responseText, groundingChunks: [], usedRAG: true, filesUsed: store.texts.length });
+        try {
+          console.log(`   📡 Llamando a Gemini API...`);
+          const responseText = await callGeminiREST(fullPrompt, apiKey);
+          console.log(`   ✅ Respuesta recibida: ${responseText.length} chars`);
+          
+          return res.json({ 
+            text: responseText, 
+            groundingChunks: [], 
+            usedRAG: true, 
+            filesUsed: store.texts.length 
+          });
+        } catch (geminiError) {
+          console.error(`   ❌ Error en callGeminiREST:`, geminiError.message);
+          console.error(`   Stack:`, geminiError.stack);
+          throw geminiError;
+        }
+      } else {
+        console.log(`   ⚠️ Store encontrado pero sin textos`);
       }
+    } else {
+      console.log(`   ⚠️ Store no encontrado o no hay storeId`);
     }
     
-    console.log(`⚠️ Sin docs`);
+    console.log(`⚠️ Respondiendo sin RAG`);
     const responseText = await callGeminiREST(query, apiKey);
     res.json({ text: responseText, groundingChunks: [], usedRAG: false, warning: "Sin archivos" });
     
   } catch (chatErr) {
-    console.error("❌ Chat:", chatErr.message);
+    console.error("❌❌❌ ERROR CRÍTICO EN /chat ❌❌❌");
+    console.error("Mensaje:", chatErr.message);
+    console.error("Stack:", chatErr.stack);
+    console.error("Error completo:", JSON.stringify(chatErr, null, 2));
     res.status(500).json({ error: "Error chat", details: chatErr.message });
   }
 });
