@@ -1,34 +1,40 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { GoogleAIFileManager } = require("@google/generative-ai/server");
+const { initializeApp } = require('firebase-admin/app'); // <--- NUEVO
+const { getFirestore, FieldValue } = require('firebase-admin/firestore'); // <--- NUEVO
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
-const pdf = require('pdf-parse'); 
+const pdf = require('pdf-parse');
 
+// 1. INICIALIZAMOS FIREBASE (Conexión Automática en Cloud Run)
+try {
+  initializeApp();
+  console.log("🔥 Firebase conectado correctamente.");
+} catch (e) {
+  console.warn("⚠️ Firebase ya estaba inicializado o error leve:", e.message);
+}
+
+const db = getFirestore(); // Nuestra base de datos
 const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// ALMACÉN EN MEMORIA
-const STORES = new Map();
-
-// LISTA DE MODELOS A PROBAR (Orden de preferencia para 2025)
+// LISTA DE MODELOS A PROBAR
 const MODEL_CANDIDATES = [
-  "gemini-2.5-flash",        // Probable nuevo estándar
-  "gemini-2.0-flash-exp",    // Versión experimental común
-  "gemini-1.5-flash-002",    // Versión actualizada de 1.5
-  "gemini-1.5-flash-latest", // Alias genérico
-  "gemini-1.5-flash",        // Versión clásica (fallback)
-  "gemini-1.5-pro",          // Fallback potente
-  "gemini-pro"               // Último recurso (1.0)
+  "gemini-2.5-flash", 
+  "gemini-1.5-flash-002",
+  "gemini-1.5-flash-001",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro"
 ];
 
 // MIDDLEWARES
 app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', '*');
   if (req.method === 'OPTIONS') return res.status(204).send('');
   next();
@@ -40,24 +46,21 @@ const getApiKey = () => {
   return key;
 };
 
-// --- FUNCIÓN INTELIGENTE: PROBAR MODELOS HASTA QUE UNO FUNCIONE ---
+// --- FUNCIÓN HELPER: GENERAR CON FALLBACK ---
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
-      console.log(`🤖 Intentando con modelo: ${modelName}...`);
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
-      console.log(`✅ ÉXITO con ${modelName}`);
       return result.response.text();
     } catch (e) {
-      console.warn(`⚠️ Falló ${modelName}: ${e.message.split(' ')[0]}...`); // Log corto
+      console.warn(`⚠️ Falló ${modelName}:`, e.message.split(' ')[0]);
       lastError = e;
-      // Si el error NO es 404 (Not Found), quizás es otro problema, pero seguimos probando
       if (!e.message.includes('404') && !e.message.includes('not found')) {
-         // Si es error de cuota (429) o servidor (500), seguimos intentando otros modelos
+         // Si no es 404, quizás es otro error, seguimos probando
       }
     }
   }
@@ -66,17 +69,32 @@ async function generateWithFallback(apiKey, promptParts) {
 
 // --- ENDPOINTS ---
 
-app.get('/', (req, res) => res.send('Backend Cerebro Online (Multi-Model 2025) 🚀'));
+app.get('/', (req, res) => res.send('Backend Cerebro con MEMORIA FIREBASE 🧠🔥'));
 
-// 1. CREAR STORE
-app.post('/create-store', (req, res) => {
-  const name = req.body.name || req.body.displayName || "Cerebro"; 
-  const storeId = `store-${Date.now()}`;
-  STORES.set(storeId, { name, files: [], texts: [] });
-  res.json({ name: storeId }); 
+// 1. CREAR STORE (GUARDAR EN BASE DE DATOS)
+app.post('/create-store', async (req, res) => {
+  try {
+    const name = req.body.name || req.body.displayName || "Cerebro"; 
+    // Usamos el nombre como ID si queremos persistencia fácil, o uno nuevo
+    const storeId = name.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase() + "_" + Date.now();
+    
+    // Guardamos en Firestore
+    await db.collection('stores').doc(storeId).set({
+      name: name,
+      createdAt: new Date(),
+      files: [], // Array de archivos de Google
+      texts: []  // Array de textos de respaldo
+    });
+
+    console.log(`✅ Store guardado en DB: ${storeId}`);
+    res.json({ name: storeId });
+  } catch (e) {
+    console.error("Error DB:", e);
+    res.status(500).json({ error: "Fallo al crear memoria en base de datos" });
+  }
 });
 
-// 2. UPLOAD (HÍBRIDO: NATIVO + TEXTO)
+// 2. UPLOAD (SUBE A GOOGLE + EXTRAE)
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
@@ -84,7 +102,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     console.log(`📥 Procesando: ${req.file.originalname}`);
     const apiKey = getApiKey();
     
-    // A) FILE API (Nativo de Google)
+    // A) FILE API (Nativo)
     let googleFile = null;
     try {
         const fileManager = new GoogleAIFileManager(apiKey);
@@ -93,19 +111,16 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             displayName: req.file.originalname,
         });
         
-        // Esperamos a que esté activo (Polling rápido)
-        let fileState = uploadResponse.file.state;
         googleFile = {
             uri: uploadResponse.file.uri,
-            name: uploadResponse.file.name,
+            name: uploadResponse.file.name, // files/xxxx
             mimeType: uploadResponse.file.mimeType
         };
-        console.log(`☁️ Subido a Google File API: ${googleFile.name} (${fileState})`);
     } catch (googleErr) {
         console.warn("⚠️ Falló subida nativa:", googleErr.message);
     }
 
-    // B) EXTRACCIÓN LOCAL (Respaldo)
+    // B) EXTRACCIÓN LOCAL
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf') || req.file.originalname.endsWith('.pdf')) {
@@ -117,13 +132,14 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       extractedText = buffer.toString('utf-8');
     }
     
+    // Limpieza y borrado temporal
     extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
     res.json({
       file: {
         uri: googleFile ? googleFile.uri : `memory://${req.file.originalname}`,
-        googleData: googleFile, // Guardamos los datos completos de Google
+        googleData: googleFile,
         extractedText: extractedText
       }
     });
@@ -134,69 +150,87 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// 3. VINCULAR
-app.post('/link-file', (req, res) => {
-  const { storeId, fileName, extractedText, fileUri, googleData } = req.body; // googleData viene del upload
+// 3. VINCULAR (GUARDAR ARCHIVO EN LA BD)
+app.post('/link-file', async (req, res) => {
+  const { storeId, fileName, extractedText, googleData } = req.body;
   
-  if (!STORES.has(storeId)) STORES.set(storeId, { name: "Recuperado", files: [], texts: [] });
-  
-  const store = STORES.get(storeId);
-  store.texts.push({ fileName, text: extractedText }); // Siempre guardamos texto por seguridad
-  
-  if (googleData && googleData.uri) {
-      store.files.push(googleData); // Guardamos el objeto completo {uri, mimeType}
-  } else if (fileUri && fileUri.startsWith('https://')) {
-       // Compatibilidad con versiones anteriores
-      store.files.push({ uri: fileUri, mimeType: 'application/pdf' }); 
-  }
+  try {
+    const storeRef = db.collection('stores').doc(storeId);
+    
+    // Comprobamos si existe el store, si no, lo creamos (Auto-curación en BD)
+    const doc = await storeRef.get();
+    if (!doc.exists) {
+        await storeRef.set({ name: "Recuperado", createdAt: new Date(), files: [], texts: [] });
+    }
 
-  console.log(`🔗 Vinculado: ${fileName} (Nativo: ${!!googleData})`);
-  res.json({ success: true, filesInStore: store.files.length || store.texts.length });
+    // Actualizamos Arrays en Firestore usando atomicidad
+    const updates = {
+        texts: FieldValue.arrayUnion({ fileName, text: extractedText })
+    };
+
+    if (googleData && googleData.uri) {
+        updates.files = FieldValue.arrayUnion(googleData);
+    }
+
+    await storeRef.update(updates);
+
+    console.log(`🔗 ${fileName} persistido en Firestore.`);
+    res.json({ success: true });
+
+  } catch (e) {
+    console.error("Error vinculando en DB:", e);
+    res.status(500).json({ error: "No se pudo guardar en la memoria persistente" });
+  }
 });
 
-// 4. CHAT (CON SELECTOR DE MODELOS)
+// 4. CHAT (LEER DE LA BD Y RESPONDER)
 app.post('/chat', async (req, res) => {
   const { storeId, query } = req.body;
-  if (!STORES.has(storeId)) return res.json({ text: "⚠️ Memoria reiniciada. Sube archivos de nuevo." });
-
-  const store = STORES.get(storeId);
-  const apiKey = getApiKey();
 
   try {
-    // PREPARAR CONTENIDO MULTIMODAL (NATIVO)
-    // Si tenemos archivos nativos en Google, los usamos. Es mucho más potente.
+    // LEEMOS DE FIREBASE
+    const doc = await db.collection('stores').doc(storeId).get();
+    
+    if (!doc.exists) {
+        return res.json({ text: "⚠️ No encuentro esta memoria en la base de datos. ¿Es el ID correcto?" });
+    }
+
+    const storeData = doc.data();
+    const apiKey = getApiKey();
+
+    // PREPARAR PROMPT
     let promptParts = [];
     
-    if (store.files.length > 0) {
-        console.log("📎 Usando modo File Search Nativo");
-        promptParts.push({ text: "Responde a la pregunta basándote en los siguientes archivos adjuntos:" });
+    // Prioridad: Archivos Nativos
+    const files = storeData.files || [];
+    if (files.length > 0) {
+        console.log(`📎 Usando ${files.length} archivos nativos de la BD`);
+        promptParts.push({ text: "Responde basándote en estos archivos:" });
         
-        // Añadimos los archivos al prompt (Límite: los últimos 2 para no saturar si son grandes)
-        const activeFiles = store.files.slice(-5); 
+        // Tomamos los últimos 5 para no saturar
+        const activeFiles = files.slice(-5);
         activeFiles.forEach(f => {
             promptParts.push({ 
-                fileData: { 
-                    mimeType: f.mimeType || 'application/pdf', 
-                    fileUri: f.uri 
-                } 
+                fileData: { mimeType: f.mimeType, fileUri: f.uri } 
             });
         });
     } else {
-        console.log("📝 Usando modo Texto Puro (Fallback)");
-        const context = store.texts.map(t => `--- DOCUMENTO: ${t.fileName} ---\n${t.text}`).join('\n\n');
+        // Fallback: Texto plano
+        console.log("📝 Usando texto plano de la BD");
+        const texts = storeData.texts || [];
+        const context = texts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
         promptParts.push({ text: `CONTEXTO:\n${context}` });
     }
 
     promptParts.push({ text: `\nPREGUNTA: ${query}` });
 
-    // LLAMADA INTELIGENTE
     const answer = await generateWithFallback(apiKey, promptParts);
     res.json({ text: answer });
     
   } catch (e) {
-    console.error("❌ Error Fatal Chat:", e);
-    res.status(500).json({ error: `Error Gemini: ${e.message}` });
+    console.error("❌ Error Chat:", e);
+    res.status(500).json({ error: `Error: ${e.message}` });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor Final listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Firebase listo en ${PORT}`));
