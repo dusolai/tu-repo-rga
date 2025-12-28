@@ -1,20 +1,17 @@
-# Usamos una imagen ligera de Node.js
 FROM node:20-slim
-
-# Creamos el directorio de trabajo
 WORKDIR /usr/src/app
 
-# Copiamos primero los archivos de dependencias
+# 1. Copiamos los archivos de configuración
 COPY package*.json ./
 
-# Instalamos solo lo necesario para producción
-RUN npm install --only=production
+# 2. ¡AQUÍ ESTÁ EL TRUCO! 
+# Forzamos la instalación manual de las librerías que te faltan.
+# Esto ignora cualquier error en tu package.json o bloqueos.
+RUN npm install express multer pdf-parse @google/generative-ai --save
 
-# Copiamos el resto del código
+# 3. Copiamos el resto del código
 COPY . .
 
-# Exponemos el puerto 8080
+# 4. Exponemos el puerto y arrancamos
 EXPOSE 8080
-
-# Comando para arrancar el servidor
-CMD [ "npm", "start" ]
+CMD [ "node", "index.js" ]
