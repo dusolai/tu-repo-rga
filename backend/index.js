@@ -1,9 +1,9 @@
+const { GoogleGenerativeAI } = require("@google/generative-ai"); // <--- VOLVEMOS AL SDK OFICIAL
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
-const https = require('https');
-const pdf = require('pdf-parse'); 
+const pdf = require('pdf-parse');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -13,7 +13,7 @@ const upload = multer({ dest: os.tmpdir() });
 const STORES = new Map();
 
 // MIDDLEWARES
-app.use(express.json({ limit: '10mb' })); // Aumentamos límite para textos largos
+app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -28,13 +28,110 @@ const getApiKey = () => {
   return key;
 };
 
-// HELPER: Llamada a Gemini
-function callGeminiREST(prompt, apiKey) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }]
+// --- ENDPOINTS ---
+
+app.get('/', (req, res) => res.send('Backend SDK Oficial Online 🟢'));
+
+// 1. CREAR STORE
+app.post('/create-store', (req, res) => {
+  const name = req.body.name || req.body.displayName || "Cerebro"; 
+  const storeId = `store-${Date.now()}`;
+  STORES.set(storeId, { name, texts: [] });
+  console.log(`✅ Store creado: ${storeId}`);
+  res.json({ name: storeId }); 
+});
+
+// 2. UPLOAD (Igual que antes, esto ya funcionaba bien)
+app.post('/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file' });
+
+    console.log(`📥 Procesando: ${req.file.originalname}`);
+    const buffer = fs.readFileSync(req.file.path);
+    let extractedText = "";
+
+    if (req.file.mimetype === 'application/pdf' || req.file.originalname.endsWith('.pdf')) {
+      try {
+          const data = await pdf(buffer);
+          extractedText = data.text;
+      } catch (e) {
+          console.error("Error PDF:", e);
+          extractedText = "Error leyendo PDF.";
+      }
+    } else {
+      extractedText = buffer.toString('utf-8');
+    }
+
+    // Limpieza
+    extractedText = extractedText.replace(/\s+/g, ' ').trim().substring(0, 100000); // 100k chars
+    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); 
+
+    res.json({
+      file: {
+        uri: `memory://${req.file.originalname}`,
+        extractedText: extractedText
+      }
     });
 
+  } catch (error) {
+    console.error('❌ Error Upload:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. VINCULAR (Auto-Curativo)
+app.post('/link-file', (req, res) => {
+  const { storeId, fileName, extractedText } = req.body;
+  
+  if (!STORES.has(storeId)) {
+      console.warn(`⚠️ Recuperando Store ${storeId}...`);
+      STORES.set(storeId, { name: "Recuperado", texts: [] });
+  }
+  
+  const store = STORES.get(storeId);
+  store.texts.push({ fileName, text: extractedText });
+  console.log(`🔗 Guardado: ${fileName} (${store.texts.length} docs)`);
+  res.json({ success: true, filesInStore: store.texts.length });
+});
+
+// 4. CHAT (CON SDK OFICIAL - ROBUSTO)
+app.post('/chat', async (req, res) => {
+  const { storeId, query } = req.body;
+  
+  if (!STORES.has(storeId)) {
+      return res.json({ text: "⚠️ Reinicio del servidor. Por favor sube los documentos de nuevo." });
+  }
+
+  const store = STORES.get(storeId);
+  const context = store.texts.map(t => `--- DOCUMENTO: ${t.fileName} ---\n${t.text}`).join('\n\n');
+  
+  const prompt = `
+  Eres un asistente experto. Responde usando SOLO este contexto.
+  
+  CONTEXTO:
+  ${context}
+  
+  PREGUNTA: ${query}
+  `;
+
+  try {
+    // USAMOS EL SDK OFICIAL (Mucho más estable que la llamada manual)
+    const genAI = new GoogleGenerativeAI(getApiKey());
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    res.json({ text });
+  } catch (e) {
+    console.error("❌ Error Chat SDK:", e);
+    // Devolvemos el mensaje de error real para verlo en el frontend
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`🚀 Servidor SDK listo en ${PORT}`));
     const options = {
       hostname: 'generativelanguage.googleapis.com',
       path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
