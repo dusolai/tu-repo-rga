@@ -4,99 +4,67 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { GoogleAIFileManager } = require("@google/generative-ai/server");
 const fs = require('fs');
 const os = require('os');
-const path = require('path');
 
 // === CONFIGURACIÓN ===
 const app = express();
 const PORT = process.env.PORT || 8080;
-
-// Configuración de Multer
 const upload = multer({ dest: os.tmpdir() });
 
 // === ALMACENAMIENTO EN MEMORIA ===
-// Aquí guardamos los archivos subidos por cada "cerebro"
-const STORES = new Map(); // { storeId: { files: [...fileUris], displayName: "..." } }
+const STORES = new Map();
 
 // === MIDDLEWARES ===
-
-// CORS Permisivo
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', '*');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(204).send('');
-  }
+  if (req.method === 'OPTIONS') return res.status(204).send('');
   next();
 });
 
-// Helper para obtener API Key
 const getApiKey = () => {
   const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("Falta GEMINI_API_KEY en variables de entorno");
+  if (!key) throw new Error("Falta GEMINI_API_KEY");
   return key;
 };
 
 // === RUTAS ===
 
-// Health Check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'online', 
-    service: 'Backend Cerebro Diego RAG',
-    version: '3.0.0',
+    service: 'Backend Cerebro Diego RAG v5',
     stores: STORES.size,
-    port: PORT,
     timestamp: new Date().toISOString()
   });
 });
 
-// Crear Store
 app.post('/create-store', express.json(), (req, res) => {
   const { displayName } = req.body;
   const storeId = `fileSearchStores/cerebrodiego${Date.now()}-2v05e2bf140h`;
-  
   STORES.set(storeId, {
     displayName: displayName || 'Cerebro',
     files: [],
+    texts: [], // ← Guardamos el texto extraído aquí
     createdAt: new Date().toISOString()
   });
-  
   console.log(`📦 Store creado: ${storeId}`);
   res.json({ name: storeId });
 });
 
-// Upload de archivo
 app.post('/upload', (req, res) => {
   console.log("📥 Iniciando recepción de archivo...");
-  
   const uploadSingle = upload.single('file');
 
   uploadSingle(req, res, async (err) => {
-    // 1. Manejo de errores de Multer
-    if (err) {
-      console.error("❌ Error en Multer:", err.message);
-      return res.status(500).json({ 
-        error: "Fallo al recibir el archivo", 
-        details: err.message 
-      });
-    }
-
-    // 2. Validar que llegó el archivo
-    if (!req.file) {
-      console.error("❌ No se recibió ningún archivo");
-      return res.status(400).json({ 
-        error: "No se envió ningún archivo en el campo 'file'" 
-      });
+    if (err || !req.file) {
+      console.error("❌ Error Multer o sin archivo");
+      return res.status(500).json({ error: "Error recibiendo archivo" });
     }
 
     console.log(`✅ Archivo recibido: ${req.file.originalname}`);
-    console.log(`   Ruta temporal: ${req.file.path}`);
-    console.log(`   Tamaño: ${(req.file.size / 1024).toFixed(2)} KB`);
 
     try {
-      // 3. Subir a Google Gemini
       const apiKey = getApiKey();
       const fileManager = new GoogleAIFileManager(apiKey);
       
@@ -105,176 +73,168 @@ app.post('/upload', (req, res) => {
         displayName: req.body.displayName || req.file.originalname,
       });
 
-      console.log(`🚀 Subido a Gemini: ${uploadResult.file.name}`);
-      console.log(`   URI: ${uploadResult.file.uri}`);
+      console.log(`🚀 Subido a Gemini: ${uploadResult.file.uri}`);
 
-      // 4. Limpiar archivo temporal
-      fs.unlink(req.file.path, (unlinkErr) => {
-        if (unlinkErr) console.warn("⚠️ No se pudo borrar el temporal:", unlinkErr.message);
-      });
+      // EXTRAER TEXTO del archivo usando Gemini
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
       
-      // 5. GUARDAR en el store temporal (lo haremos en /link-file)
+      const fileContent = fs.readFileSync(req.file.path);
+      const base64 = fileContent.toString('base64');
+      
+      const extractResult = await model.generateContent([
+        {
+          inlineData: {
+            mimeType: req.body.mimeType || req.file.mimetype,
+            data: base64
+          }
+        },
+        { text: "Extrae TODO el texto de este documento. No resumas, copia el contenido completo." }
+      ]);
+      
+      const extractedText = extractResult.response.text();
+      console.log(`📄 Texto extraído: ${extractedText.length} caracteres`);
+
+      fs.unlinkSync(req.file.path);
+      
       res.json({
         success: true,
         file: {
           name: uploadResult.file.name,
           uri: uploadResult.file.uri,
-          mimeType: uploadResult.file.mimeType
+          mimeType: uploadResult.file.mimeType,
+          extractedText: extractedText // ← Enviamos el texto al frontend
         }
       });
 
     } catch (geminiErr) {
-      console.error("❌ Error subiendo a Gemini:", geminiErr.message);
-      
-      // Limpiar archivo si falla
-      if (fs.existsSync(req.file.path)) {
-        fs.unlinkSync(req.file.path);
-      }
-      
-      res.status(500).json({ 
-        error: "Error procesando con Gemini", 
-        details: geminiErr.message 
-      });
+      console.error("❌ Error Gemini:", geminiErr.message);
+      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      res.status(500).json({ error: "Error procesando", details: geminiErr.message });
     }
   });
 });
 
-// Vincular archivo a store
 app.post('/link-file', express.json(), (req, res) => {
-  const { storeId, fileUri, fileName } = req.body;
+  const { storeId, fileUri, fileName, extractedText } = req.body;
   
-  console.log(`🔗 Vinculando archivo a store: ${storeId}`);
+  console.log(`🔗 Vinculando archivo a: ${storeId}`);
   
-  // CRÍTICO: Aquí es donde asociamos archivos al cerebro
   if (!STORES.has(storeId)) {
-    console.warn(`⚠️ Store no encontrado: ${storeId}, creando uno nuevo...`);
+    console.warn(`⚠️ Store no encontrado, creando...`);
     STORES.set(storeId, {
-      displayName: 'Cerebro Auto-creado',
+      displayName: 'Cerebro Auto',
       files: [],
+      texts: [],
       createdAt: new Date().toISOString()
     });
   }
   
   const store = STORES.get(storeId);
   
-  // Agregar archivo si no existe
   if (fileUri && !store.files.some(f => f.uri === fileUri)) {
     store.files.push({
       uri: fileUri,
       name: fileName || 'documento',
       addedAt: new Date().toISOString()
     });
-    console.log(`✅ Archivo vinculado. Total archivos en ${storeId}: ${store.files.length}`);
+    
+    // Guardar el texto extraído
+    if (extractedText) {
+      store.texts.push({
+        fileName: fileName || 'documento',
+        content: extractedText
+      });
+    }
+    
+    console.log(`✅ Archivo vinculado. Total: ${store.files.length}`);
   }
   
-  res.json({ 
-    status: "OK",
-    filesInStore: store.files.length
-  });
+  res.json({ status: "OK", filesInStore: store.files.length });
 });
 
-// Chat con RAG REAL
 app.post('/chat', express.json(), async (req, res) => {
   try {
     const { query, storeId } = req.body;
     
-    if (!query) {
-      return res.status(400).json({ error: "Falta el parámetro 'query'" });
-    }
+    if (!query) return res.status(400).json({ error: "Falta query" });
     
-    console.log(`💬 Consulta recibida: "${query}"`);
-    console.log(`   Store ID: ${storeId || 'N/A'}`);
+    console.log(`💬 Consulta: "${query}"`);
+    console.log(`   Store: ${storeId || 'N/A'}`);
     
     const apiKey = getApiKey();
     const genAI = new GoogleGenerativeAI(apiKey);
     
-    // LÓGICA RAG: Si hay storeId y tiene archivos, usar FileSearch
+    // RAG SIMPLE: Agregar el contexto al prompt
     if (storeId && STORES.has(storeId)) {
       const store = STORES.get(storeId);
       
-      if (store.files.length > 0) {
-        console.log(`🔍 Usando RAG con ${store.files.length} archivos`);
+      if (store.texts && store.texts.length > 0) {
+        console.log(`🔍 Usando RAG con ${store.texts.length} documentos`);
         
-        // Construir herramientas de búsqueda
-        const fileDataParts = store.files.map(file => ({
-          fileData: {
-            fileUri: file.uri,
-            mimeType: "application/pdf" // Ajustar según tipo real
-          }
-        }));
+        // Construir contexto
+        const context = store.texts.map((t, i) => 
+          `--- DOCUMENTO ${i + 1}: ${t.fileName} ---\n${t.content}\n`
+        ).join('\n');
         
-        const model = genAI.getGenerativeModel({
-          model: "gemini-1.5-flash",
-        });
-        
-        const result = await model.generateContent([
-          {
-            fileData: {
-              mimeType: fileDataParts[0].fileData.mimeType,
-              fileUri: fileDataParts[0].fileData.fileUri
-            }
-          },
-          { text: query }
-        ]);
-        
+        const fullPrompt = `Contexto de documentos:
+${context}
+
+Pregunta del usuario: ${query}
+
+Responde SOLO basándote en la información de los documentos anteriores. Si la respuesta no está en los documentos, di "No encuentro esa información en los documentos".`;
+
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const result = await model.generateContent(fullPrompt);
         const responseText = result.response.text();
         
-        console.log(`✅ Respuesta RAG generada (${responseText.length} chars)`);
+        console.log(`✅ Respuesta RAG (${responseText.length} chars)`);
         
         return res.json({ 
           text: responseText,
-          groundingChunks: [], // Gemini API no devuelve chunks directamente aquí
+          groundingChunks: [],
           usedRAG: true,
-          filesUsed: store.files.length
+          filesUsed: store.texts.length
         });
       }
     }
     
-    // FALLBACK: Si no hay archivos, responder sin RAG
-    console.log(`⚠️ Sin archivos para RAG, usando modelo base`);
+    // Sin documentos
+    console.log(`⚠️ Sin documentos`);
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     const result = await model.generateContent(query);
-    const responseText = result.response.text();
-    
-    console.log(`✅ Respuesta base generada (${responseText.length} chars)`);
     
     res.json({ 
-      text: responseText,
+      text: result.response.text(),
       groundingChunks: [],
       usedRAG: false,
-      warning: "No se encontraron archivos en el cerebro"
+      warning: "Sin archivos en el cerebro"
     });
     
   } catch (chatErr) {
-    console.error("❌ Error en chat:", chatErr.message);
-    console.error(chatErr.stack);
-    res.status(500).json({ 
-      error: "Error en chat", 
-      details: chatErr.message 
-    });
+    console.error("❌ Error chat:", chatErr.message);
+    res.status(500).json({ error: "Error en chat", details: chatErr.message });
   }
 });
 
-// Debug: Ver stores
 app.get('/debug/stores', (req, res) => {
   const storesArray = Array.from(STORES.entries()).map(([id, data]) => ({
     id,
-    ...data
+    displayName: data.displayName,
+    filesCount: data.files.length,
+    textsCount: data.texts?.length || 0,
+    createdAt: data.createdAt
   }));
-  res.json({ 
-    total: STORES.size,
-    stores: storesArray 
-  });
+  res.json({ total: STORES.size, stores: storesArray });
 });
 
-// === ARRANQUE DEL SERVIDOR ===
+// === INICIO ===
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════╗
-║   🧠 BACKEND CEREBRO DIEGO RAG v3     ║
+║   🧠 BACKEND CEREBRO v5 (TEXT-BASED)  ║
 ║   Puerto: ${PORT}                        ║
-║   RAG: ACTIVADO ✅                    ║
-║   Stores en memoria: ${STORES.size}              ║
+║   RAG: Extracción de texto ✅         ║
 ╚════════════════════════════════════════╝
   `);
 });
