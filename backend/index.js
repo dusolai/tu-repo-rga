@@ -30,9 +30,17 @@ const getApiKey = () => {
 // Llamada REST API v1 (ESTABLE)
 async function callGeminiREST(prompt, apiKey) {
   return new Promise((resolve, reject) => {
+    // Escapar caracteres especiales en el prompt
+    const safePrompt = prompt
+      .replace(/\\/g, '\\\\')  // Escapar backslashes
+      .replace(/"/g, '\\"')    // Escapar comillas dobles
+      .replace(/\n/g, '\\n')   // Escapar saltos de línea
+      .replace(/\r/g, '\\r')   // Escapar retornos de carro
+      .replace(/\t/g, '\\t');  // Escapar tabs
+
     const data = JSON.stringify({
       contents: [{
-        parts: [{ text: prompt }]
+        parts: [{ text: safePrompt }]
       }]
     });
 
@@ -43,7 +51,7 @@ async function callGeminiREST(prompt, apiKey) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': data.length
+        'Content-Length': Buffer.byteLength(data)
       }
     };
 
