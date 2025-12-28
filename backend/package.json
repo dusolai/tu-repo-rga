@@ -1,6 +1,6 @@
 {
   "name": "backend-cerebro",
-  "version": "7.0.0",
+  "version": "8.0.0",
   "description": "Backend RAG con REST API pura (sin SDK)",
   "main": "index.js",
   "scripts": {
