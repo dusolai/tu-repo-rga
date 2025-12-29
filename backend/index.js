@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. CONFIGURACIÓN FIREBASE ---
+// --- 1. CONEXIÓN FIREBASE ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -30,12 +30,12 @@ try {
 
 const STORES_RAM = new Map();
 
-// CAMBIO: Priorizamos modelos estables para que el chat no falle
+// --- 2. MOTOR IA (Prioridad: 2.0 -> 1.5 Pro -> 1.5 Flash) ---
 const MODEL_CANDIDATES = [ 
-    "gemini-1.5-flash",          // Rápido y estable
-    "gemini-1.5-flash-002",      // Versión nueva
-    "gemini-1.5-pro",            // Más inteligente
-    "gemini-2.0-flash-exp"       // Experimental (último recurso)
+    "gemini-2.0-flash-exp",      // La bestia (Experimental)
+    "gemini-1.5-pro-002",        // El cerebro potente
+    "gemini-1.5-flash",          // El rápido y fiable
+    "gemini-1.5-flash-002"
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -53,36 +53,43 @@ const getApiKey = () => {
   return key;
 };
 
+// HELPER: Generación Robusta con Logs
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
+
   for (const modelName of MODEL_CANDIDATES) {
     try {
+      // console.log(`🤖 Intentando motor: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
-      return result.response.text();
+      const text = result.response.text();
+      // Si responde vacío, lo consideramos error para probar el siguiente
+      if (!text) throw new Error("Respuesta vacía");
+      return text; 
     } catch (e) {
-        console.warn(`⚠️ Modelo ${modelName} falló:`, e.message.split(' ')[0]);
+        console.warn(`⚠️ Falló ${modelName}: ${e.message.split(' ')[0]}`);
         lastError = e;
+        // Si es error de cuota (429), a veces esperar un poco ayuda, pero aquí saltamos al siguiente modelo
     }
   }
-  throw new Error(`Todos los modelos fallaron. Último error: ${lastError?.message}`);
+  throw new Error(`Todos los modelos fallaron. Error: ${lastError?.message || "Desconocido"}`);
 }
 
-app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Activo" : "Inactivo" }));
+app.get('/', (req, res) => res.json({ status: "Online 🟢", db: db ? "Conectada" : "RAM" }));
 
 // 1. CREATE STORE
 app.post('/create-store', (req, res) => {
   const name = req.body.name || "Cerebro"; 
   const storeId = `cerebro_${Date.now()}`;
-  res.json({ name: storeId }); // Respuesta inmediata
+  res.json({ name: storeId }); 
 
   (async () => {
     STORES_RAM.set(storeId, { name, files: [], texts: [] });
     if (db) {
         try {
             await db.collection('stores').doc(storeId).set({ name, createdAt: new Date(), files: [], texts: [] });
-        } catch(e) { console.error("Error Background Create:", e.message); }
+        } catch(e) { console.error("Bg Create Error:", e.message); }
     }
   })();
 });
@@ -92,7 +99,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
     
-    // Extracción Texto
+    // Texto
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf')) {
@@ -100,7 +107,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     } else { extractedText = buffer.toString('utf-8'); }
     extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
 
-    // Subida Google
+    // Google File API
     let googleFile = null;
     try {
         const apiKey = getApiKey();
@@ -112,7 +119,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             mimeType: uploadResponse.file.mimeType,
             displayName: req.file.originalname
         };
-    } catch (e) { console.warn("Upload IA falló (usando texto):", e.message); }
+    } catch (e) { console.warn("Upload IA error:", e.message); }
 
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
@@ -122,7 +129,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
 // 3. LINK FILE (ASÍNCRONO)
 app.post('/link-file', (req, res) => {
-  res.json({ success: true }); // Éxito inmediato
+  res.json({ success: true });
 
   const { storeId, fileName, extractedText, googleData } = req.body;
   (async () => {
@@ -143,70 +150,60 @@ app.post('/link-file', (req, res) => {
             await storeRef.update(updates);
             console.log(`💾 Persistido: ${fileName}`);
         }
-      } catch (e) {
-          console.error(`⚠️ Error guardado segundo plano: ${e.message}`);
-      }
+      } catch (e) { console.error(`Bg Save Error: ${e.message}`); }
   })();
 });
 
-// 4. CHAT (CORREGIDO PARA NO FALLAR AL RECUPERAR)
+// 4. CHAT (ZONA DE SEGURIDAD MÁXIMA)
 app.post('/chat', async (req, res) => {
   const { storeId, query } = req.body;
   let storeData = STORES_RAM.get(storeId);
 
-  // Intentar recuperar de DB
+  // Recuperación DB
   if (!storeData && db) {
       try {
           const doc = await db.collection('stores').doc(storeId).get();
           if (doc.exists) {
               storeData = doc.data();
-              // --- PROTECCIÓN CRÍTICA ---
-              // Si los arrays no existen en DB, los inicializamos vacíos para que no explote
-              if (!storeData.files) storeData.files = [];
-              if (!storeData.texts) storeData.texts = [];
-              
               STORES_RAM.set(storeId, storeData);
-              console.log("📥 Cerebro recuperado OK");
           }
-      } catch (e) {
-          console.error("Error recuperando DB:", e.message);
-      }
+      } catch (e) { console.error("DB Read Error:", e.message); }
   }
 
-  if (!storeData) return res.json({ text: "⚠️ No encuentro tu cerebro en la base de datos. Prueba a subir archivos de nuevo." });
+  if (!storeData) return res.json({ text: "⚠️ No encuentro memoria. Por favor, sube un archivo para empezar." });
 
   try {
     const apiKey = getApiKey();
     let promptParts = [];
     
-    // Construcción de Prompt Segura
-    const files = storeData.files || [];
-    const texts = storeData.texts || [];
+    // --- LIMPIEZA DE DATOS (CRUCIAL) ---
+    // Nos aseguramos de que sean arrays y filtramos nulos para que no explote
+    const safeFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
+    const safeTexts = (storeData.texts || []).filter(t => t && t.text);
 
-    if (files.length > 0) {
-        promptParts.push({ text: "Contexto (Archivos):" });
-        // Usamos los últimos 3 para no saturar
-        files.slice(-3).forEach(f => {
-            if (f.uri && f.mimeType) {
-                promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
-            }
+    if (safeFiles.length > 0) {
+        promptParts.push({ text: "Analiza estos documentos:" });
+        // Últimos 5 archivos
+        safeFiles.slice(-5).forEach(f => {
+            promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
         });
     } 
     
-    // Siempre añadimos texto como respaldo si hay
-    if (texts.length > 0) {
-        const context = texts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
-        promptParts.push({ text: `Contexto (Texto):\n${context}` });
+    if (safeTexts.length > 0) {
+        const context = safeTexts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
+        promptParts.push({ text: `Información extra:\n${context}` });
     }
 
-    promptParts.push({ text: `\nPregunta: ${query}` });
+    promptParts.push({ text: `\nPREGUNTA USUARIO: ${query}` });
 
+    // Llamada Segura
     const answer = await generateWithFallback(apiKey, promptParts);
     res.json({ text: answer });
     
   } catch (e) { 
-      console.error("❌ Error Chat:", e);
-      res.status(500).json({ error: `Error generando respuesta: ${e.message}` }); 
+      console.error("❌ CHAT ERROR:", e);
+      // Devolvemos el error al usuario para que sepa qué pasa
+      res.status(500).json({ error: `Error del Sistema: ${e.message}` }); 
   }
 });
 
@@ -221,8 +218,6 @@ app.get('/files', async (req, res) => {
             const doc = await db.collection('stores').doc(storeId).get();
             if (doc.exists) {
                 storeData = doc.data();
-                if (!storeData.files) storeData.files = [];
-                if (!storeData.texts) storeData.texts = [];
                 STORES_RAM.set(storeId, storeData);
             }
         } catch (e) {}
@@ -230,12 +225,15 @@ app.get('/files', async (req, res) => {
 
     if (!storeData) return res.json({ files: [] });
 
+    const safeFiles = (storeData.files || []).filter(f => f);
+    const safeTexts = (storeData.texts || []).filter(t => t);
+
     const fileNames = [
-        ...(storeData.files || []).map(f => f.displayName || f.name),
-        ...(storeData.texts || []).map(t => t.fileName)
+        ...safeFiles.map(f => f.displayName || f.name),
+        ...safeTexts.map(t => t.fileName)
     ];
-    const uniqueFiles = [...new Set(fileNames.filter(Boolean))]; // Filtramos nulos
+    const uniqueFiles = [...new Set(fileNames.filter(Boolean))];
     res.json({ files: uniqueFiles });
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor Final Blindado listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Anti-Crash listo en ${PORT}`));
