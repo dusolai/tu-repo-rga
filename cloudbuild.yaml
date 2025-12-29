@@ -17,7 +17,7 @@ steps:
       - 'push'
       - 'gcr.io/$PROJECT_ID/backend-cerebro:$COMMIT_SHA'
 
-  # Paso 3: Desplegar en Cloud Run
+  # Paso 3: Desplegar en Cloud Run (CORREGIDO: UPDATE EN LUGAR DE SET)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -28,18 +28,18 @@ steps:
       - '--region=europe-southwest1'
       - '--platform=managed'
       - '--allow-unauthenticated'
-      - '--set-env-vars=GEMINI_API_KEY=${_GEMINI_API_KEY}'
+      - '--update-env-vars=GEMINI_API_KEY=${_GEMINI_API_KEY}'  # <--- AQUÍ ESTABA EL PROBLEMA
 
 # Configuración de imágenes a mantener
 images:
   - 'gcr.io/$PROJECT_ID/backend-cerebro:$COMMIT_SHA'
   - 'gcr.io/$PROJECT_ID/backend-cerebro:latest'
 
-# Sustituciones (variables que necesitas configurar)
+# Sustituciones
 substitutions:
-  _GEMINI_API_KEY: 'PLACEHOLDER'  # Configura esto en Cloud Build
+  _GEMINI_API_KEY: 'PLACEHOLDER'
 
-# Opciones de timeout
+# Opciones
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: 'E2_HIGHCPU_8'
