@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. FIREBASE (Persistencia) ---
+// --- 1. CONEXIÓN FIREBASE ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -30,13 +30,12 @@ try {
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS LIMPIA (Sin alias rotos) ---
+// --- 2. LISTA DE MODELOS (ALIAS GENÉRICOS) ---
+// Usamos los nombres genéricos para evitar errores 404 por versiones retiradas.
 const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",      // 1. EL FUTURO (Si está disponible)
-    "gemini-1.5-pro-002",        // 2. Potente actualizado
-    "gemini-1.5-flash-002",      // 3. Rápido actualizado
-    "gemini-1.5-flash-001",      // 4. EL INTOCABLE (Siempre funciona)
-    "gemini-1.5-pro-001"         // 5. Respaldo final
+    "gemini-2.0-flash-exp",      // 1. EL QUE TÚ QUIERES (Experimental)
+    "gemini-1.5-flash",          // 2. EL INDESTRUCTIBLE (Alias genérico, siempre funciona)
+    "gemini-1.5-pro"             // 3. RESPALDO POTENTE (Alias genérico)
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -54,13 +53,14 @@ const getApiKey = () => {
   return key;
 };
 
-// Generación robusta: Si uno falla, prueba el siguiente SIN CRASH
+// HELPER: Generación a prueba de fallos
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
+      // console.log(`🤖 Probando: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
       const text = result.response.text();
@@ -68,10 +68,10 @@ async function generateWithFallback(apiKey, promptParts) {
     } catch (e) {
         console.warn(`⚠️ Modelo ${modelName} saltado: ${e.message.split(' ')[0]}`);
         lastError = e;
+        // Si el 2.0 falla, pasará inmediatamente al 1.5-flash sin que te des cuenta
     }
   }
-  // Mensaje de error detallado si TODO falla
-  throw new Error(`Error Gemini: Todos los modelos fallaron. (Intento final: ${lastError?.message})`);
+  throw new Error(`Todos los modelos fallaron. Revisa tu API Key. (Error final: ${lastError?.message})`);
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
@@ -97,7 +97,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
     
-    // Texto local
+    // Extracción Texto
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf')) {
@@ -105,7 +105,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     } else { extractedText = buffer.toString('utf-8'); }
     extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
 
-    // Google File API
+    // Subida Google
     let googleFile = null;
     try {
         const apiKey = getApiKey();
@@ -151,7 +151,7 @@ app.post('/link-file', (req, res) => {
   })();
 });
 
-// 4. CHAT
+// 4. CHAT (CON PROTECCIÓN DE DATOS)
 app.post('/chat', async (req, res) => {
   const { storeId, query } = req.body;
   let storeData = STORES_RAM.get(storeId);
@@ -162,7 +162,6 @@ app.post('/chat', async (req, res) => {
           const doc = await db.collection('stores').doc(storeId).get();
           if (doc.exists) {
               storeData = doc.data();
-              // --- SANITIZACIÓN DE DATOS ---
               if (!storeData.files) storeData.files = [];
               if (!storeData.texts) storeData.texts = [];
               STORES_RAM.set(storeId, storeData);
@@ -176,13 +175,12 @@ app.post('/chat', async (req, res) => {
     const apiKey = getApiKey();
     let promptParts = [];
     
-    // Filtrar datos corruptos
+    // Filtro de seguridad (null check)
     const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
     const validTexts = (storeData.texts || []).filter(t => t && t.text);
 
     if (validFiles.length > 0) {
         promptParts.push({ text: "Analiza estos documentos:" });
-        // Últimos 5
         validFiles.slice(-5).forEach(f => {
             promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
         });
