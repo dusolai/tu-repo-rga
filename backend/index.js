@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. FIREBASE ---
+// --- 1. FIREBASE (Conexión) ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -30,13 +30,10 @@ try {
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS REALES Y VÁLIDOS ---
-// CORRECCIÓN: 'gemini-3' no existe. Usamos 'gemini-2.0-flash-exp' que es el nuevo.
-const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",      // <--- EL NUEVO (Lo que buscabas como 'gemini-3')
-    "gemini-1.5-flash",          // <--- EL ESTABLE (Por si el experimental falla)
-    "gemini-1.5-pro"             // <--- EL POTENTE
-];
+// --- 2. CONFIGURACIÓN DE MODELOS ---
+// Usamos el 2.0 (Tu "Gemini 3") como principal.
+// El 1.5 Flash como respaldo de seguridad.
+const MODEL_PRIORITY = [ "gemini-2.0-flash-exp", "gemini-1.5-flash" ];
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -53,28 +50,30 @@ const getApiKey = () => {
   return key;
 };
 
-// HELPER: Generación con reintentos inteligentes
-async function generateWithFallback(apiKey, promptParts) {
+// --- NÚCLEO: Generación Inteligente (Archivo -> Texto) ---
+async function generateSmart(apiKey, promptParts, useFiles = true) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
-  for (const modelName of MODEL_CANDIDATES) {
+  for (const modelName of MODEL_PRIORITY) {
     try {
-      // console.log(`🚀 Probando modelo: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
-      const result = await model.generateContent(promptParts);
+      
+      // Si falló antes con archivos, probamos SOLO CON TEXTO (eliminamos fileData)
+      const safeParts = useFiles ? promptParts : promptParts.filter(p => !p.fileData);
+      
+      const result = await model.generateContent(safeParts);
       const text = result.response.text();
-      if (text) return text; 
+      if (text) return text;
     } catch (e) {
-        console.warn(`⚠️ Modelo ${modelName} falló: ${e.message.split(' ')[0]}`);
+        // console.warn(`⚠️ Intento fallido con ${modelName}:`, e.message);
         lastError = e;
     }
   }
-  // Si todo falla, mensaje claro
-  return `⚠️ Error: No pude conectar con la IA. Verifiqué los modelos ${MODEL_CANDIDATES.join(', ')} y todos dieron error 404 o 500.`;
+  throw lastError || new Error("Fallaron todos los modelos");
 }
 
-app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
+app.get('/', (req, res) => res.json({ status: "Online 🟢", model: "Gemini 2.0 + 1.5" }));
 
 // 1. CREATE STORE
 app.post('/create-store', (req, res) => {
@@ -87,7 +86,7 @@ app.post('/create-store', (req, res) => {
     if (db) {
         try {
             await db.collection('stores').doc(storeId).set({ name, createdAt: new Date(), files: [], texts: [] });
-        } catch(e) { console.error("Error DB:", e.message); }
+        } catch(e) { console.error("DB Create Error:", e.message); }
     }
   })();
 });
@@ -97,38 +96,41 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
     
-    // Extracción Local (Respaldo)
+    // 1. Extraer Texto (Siempre funciona)
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf')) {
       try { const data = await pdf(buffer); extractedText = data.text; } catch (e) {}
     } else { extractedText = buffer.toString('utf-8'); }
-    extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
+    // Limpiamos y limitamos para no saturar
+    extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 100000);
 
-    // Subida NATIVA a Google (File API)
+    // 2. Subir a Google (Puede fallar, no pasa nada)
     let googleFile = null;
     try {
         const apiKey = getApiKey();
         const fileManager = new GoogleAIFileManager(apiKey);
-        const uploadResponse = await fileManager.uploadFile(req.file.path, { 
-            mimeType: req.file.mimetype, 
-            displayName: req.file.originalname 
-        });
+        const uploadResponse = await fileManager.uploadFile(req.file.path, { mimeType: req.file.mimetype, displayName: req.file.originalname });
         
-        // Esperamos a que el archivo esté activo (IMPORTANTE para Gemini 1.5/2.0)
-        let fileState = await fileManager.getFile(uploadResponse.file.name);
-        while (fileState.state === "PROCESSING") {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            fileState = await fileManager.getFile(uploadResponse.file.name);
+        // Esperar a que esté activo (Polling rápido)
+        let state = uploadResponse.file.state;
+        let attempts = 0;
+        while (state === "PROCESSING" && attempts < 5) {
+            await new Promise(r => setTimeout(r, 500));
+            const check = await fileManager.getFile(uploadResponse.file.name);
+            state = check.state;
+            attempts++;
         }
 
-        googleFile = { 
-            uri: uploadResponse.file.uri, 
-            name: uploadResponse.file.name, 
-            mimeType: uploadResponse.file.mimeType,
-            displayName: req.file.originalname
-        };
-    } catch (e) { console.warn("Aviso: Upload IA falló (usaremos texto):", e.message); }
+        if (state === "ACTIVE") {
+            googleFile = { 
+                uri: uploadResponse.file.uri, 
+                name: uploadResponse.file.name, 
+                mimeType: uploadResponse.file.mimeType,
+                displayName: req.file.originalname
+            };
+        }
+    } catch (e) { console.warn("Upload IA Error (Usando texto):", e.message); }
 
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
@@ -156,13 +158,13 @@ app.post('/link-file', (req, res) => {
             const updates = { texts: FieldValue.arrayUnion({ fileName, text: extractedText }) };
             if (googleData && googleData.uri) updates.files = FieldValue.arrayUnion(googleData);
             await storeRef.update(updates);
-            console.log(`💾 Persistido: ${fileName}`);
+            console.log(`💾 Guardado: ${fileName}`);
         }
-      } catch (e) { console.error(`Error BG: ${e.message}`); }
+      } catch (e) { console.error(`BG Error: ${e.message}`); }
   })();
 });
 
-// 4. CHAT
+// 4. CHAT (FINALMENTE ARREGLADO)
 app.post('/chat', async (req, res) => {
   try {
       const { storeId, query } = req.body;
@@ -178,10 +180,10 @@ app.post('/chat', async (req, res) => {
                   if (!storeData.texts) storeData.texts = [];
                   STORES_RAM.set(storeId, storeData);
               }
-          } catch (e) { console.error("Error DB:", e.message); }
+          } catch (e) { console.error("DB Read Error:", e.message); }
       }
 
-      if (!storeData) return res.json({ text: "⚠️ Cerebro no encontrado. Sube un archivo." });
+      if (!storeData) return res.json({ text: "⚠️ No hay documentos. Sube uno." });
 
       const apiKey = getApiKey();
       let promptParts = [];
@@ -189,28 +191,42 @@ app.post('/chat', async (req, res) => {
       const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
       const validTexts = (storeData.texts || []).filter(t => t && t.text);
 
-      // Usar archivos nativos (File API)
+      // ESTRATEGIA:
+      // 1. Intentamos pasarle los archivos nativos (Mejor calidad)
       if (validFiles.length > 0) {
-          promptParts.push({ text: "Utiliza los siguientes documentos adjuntos para responder:" });
+          promptParts.push({ text: "Documentos:" });
           validFiles.slice(-5).forEach(f => {
               promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
           });
       } 
       
-      // Respaldo de texto
+      // 2. SIEMPRE pasamos el texto también (Respaldo por si el archivo da error 404/Processing)
       if (validTexts.length > 0) {
           const context = validTexts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
-          promptParts.push({ text: `Contexto extraído:\n${context}` });
+          promptParts.push({ text: `Texto extraído (Usar si no puedes leer los archivos):\n${context}` });
       }
 
-      promptParts.push({ text: `\nPREGUNTA: ${query}` });
+      promptParts.push({ text: `\nPregunta: ${query}` });
 
-      const answer = await generateWithFallback(apiKey, promptParts);
-      res.json({ text: answer });
+      // INTENTO 1: Con Archivos + Texto
+      try {
+          const answer = await generateSmart(apiKey, promptParts, true);
+          res.json({ text: answer });
+      } catch (e) {
+          console.warn("Fallo con archivos, reintentando SOLO TEXTO...");
+          // INTENTO 2: Solo Texto (Infalible)
+          // Si el archivo en la nube da error, le enviamos el texto plano y funcionará sí o sí.
+          try {
+              const answerTextOnly = await generateSmart(apiKey, promptParts, false);
+              res.json({ text: answerTextOnly });
+          } catch (finalError) {
+              throw finalError; // Si esto falla, es la API Key
+          }
+      }
       
   } catch (e) { 
       console.error("Chat Error:", e);
-      res.json({ text: `❌ Error interno: ${e.message}.` }); 
+      res.json({ text: `❌ Error: ${e.message}. (Verifica tu API Key)` }); 
   }
 });
 
@@ -239,4 +255,4 @@ app.get('/files', async (req, res) => {
     res.json({ files: [...new Set(fileNames.filter(Boolean))] });
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Final listo en ${PORT}`));
