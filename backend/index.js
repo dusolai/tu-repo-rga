@@ -30,12 +30,18 @@ try {
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS SEGURA ---
-// Hemos quitado 'gemini-1.5-pro' porque es el que te daba Error 404.
-// Esta lista usa el experimental (2.0) y cae al Flash (universal).
+// --- 2. LISTA DE MODELOS "A PRUEBA DE TODO" ---
+// Incluye versiones experimentales, estables, específicas y LEGACY.
+// Si las versiones 1.5 te dan error 404, la versión 'gemini-pro' (1.0) te salvará.
 const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",   // 1. TU PREFERIDO (Experimental)
-    "gemini-1.5-flash"        // 2. EL INDESTRUCTIBLE (Nunca da 404)
+    "gemini-2.0-flash-exp",      // 1. Prioridad: Experimental (El más listo)
+    "gemini-1.5-flash",          // 2. Estándar Flash
+    "gemini-1.5-flash-latest",   // 3. Puntero Latest (A veces resuelve mejor el 404)
+    "gemini-1.5-flash-001",      // 4. Versión congelada 001
+    "gemini-1.5-flash-002",      // 5. Versión congelada 002
+    "gemini-1.5-pro",            // 6. Estándar Pro
+    "gemini-1.5-pro-latest",     // 7. Pro Latest
+    "gemini-pro"                 // 8. EL SALVAVIDAS (Versión 1.0, vieja pero muy compatible)
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -53,26 +59,31 @@ const getApiKey = () => {
   return key;
 };
 
-// Generación: Iteración segura
+// HELPER: Iteración robusta
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
-      // console.log(`🤖 Probando: ${modelName}`);
+      // console.log(`🔄 Probando motor: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
+      
+      // Intentamos generar
       const result = await model.generateContent(promptParts);
       const text = result.response.text();
-      if (text) return text; 
+      
+      if (text) return text; // ¡ÉXITO!
+      
     } catch (e) {
-        console.warn(`⚠️ Modelo ${modelName} saltado: ${e.message.split(' ')[0]}`);
+        // Ignoramos el error (sea 404, 500, o lo que sea) y probamos el siguiente
+        // console.warn(`⚠️ Motor ${modelName} falló: ${e.message.split(' ')[0]}`);
         lastError = e;
-        // Si falla el 2.0, pasamos INMEDIATAMENTE al 1.5-flash que sí funciona.
     }
   }
-  // Mensaje final si todo falla
-  return `⚠️ Error de conexión con IA. Último intento fallido: ${lastError?.message || "Desconocido"}`;
+  
+  // Si llegamos aquí, NINGUNO funcionó (ni siquiera el legacy).
+  return `⚠️ Error Total: No he podido conectar con ningún modelo de IA. Verifica tu API Key o la región de tu proyecto en Google Cloud. Último error: ${lastError?.message}`;
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
@@ -156,6 +167,7 @@ app.post('/chat', async (req, res) => {
       const { storeId, query } = req.body;
       let storeData = STORES_RAM.get(storeId);
 
+      // Recuperación DB
       if (!storeData && db) {
           try {
               const doc = await db.collection('stores').doc(storeId).get();
