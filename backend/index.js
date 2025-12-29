@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. FIREBASE ---
+// --- 1. FIREBASE (Persistencia) ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -30,12 +30,12 @@ try {
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS (SOLO ALIAS GENÉRICOS) ---
-// Quitamos versiones numeradas (-001) para evitar Error 404
+// --- 2. LISTA DE MODELOS SEGURA ---
+// Hemos quitado 'gemini-1.5-pro' porque es el que te daba Error 404.
+// Esta lista usa el experimental (2.0) y cae al Flash (universal).
 const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",  // 1. Tu prioridad (Experimental)
-    "gemini-1.5-flash",      // 2. El más estable del mundo (Backup)
-    "gemini-1.5-pro"         // 3. Potencia extra (Backup)
+    "gemini-2.0-flash-exp",   // 1. TU PREFERIDO (Experimental)
+    "gemini-1.5-flash"        // 2. EL INDESTRUCTIBLE (Nunca da 404)
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -53,25 +53,26 @@ const getApiKey = () => {
   return key;
 };
 
-// Generación: Si falla, prueba el siguiente modelo
+// Generación: Iteración segura
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
+      // console.log(`🤖 Probando: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
       const text = result.response.text();
       if (text) return text; 
     } catch (e) {
-        console.warn(`⚠️ Modelo ${modelName} falló: ${e.message.split(' ')[0]}`);
+        console.warn(`⚠️ Modelo ${modelName} saltado: ${e.message.split(' ')[0]}`);
         lastError = e;
-        // Continuamos al siguiente modelo automáticamente
+        // Si falla el 2.0, pasamos INMEDIATAMENTE al 1.5-flash que sí funciona.
     }
   }
-  // Si todo falla, devolvemos un texto de error en lugar de lanzar excepción
-  return `⚠️ Error técnico: No he podido conectar con los modelos de IA. Detalles: ${lastError?.message}`;
+  // Mensaje final si todo falla
+  return `⚠️ Error de conexión con IA. Último intento fallido: ${lastError?.message || "Desconocido"}`;
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
@@ -155,7 +156,6 @@ app.post('/chat', async (req, res) => {
       const { storeId, query } = req.body;
       let storeData = STORES_RAM.get(storeId);
 
-      // Recuperación DB
       if (!storeData && db) {
           try {
               const doc = await db.collection('stores').doc(storeId).get();
@@ -190,13 +190,11 @@ app.post('/chat', async (req, res) => {
 
       promptParts.push({ text: `\nPREGUNTA: ${query}` });
 
-      // LLAMADA SEGURA (Nunca hace throw)
       const answer = await generateWithFallback(apiKey, promptParts);
       res.json({ text: answer });
       
   } catch (e) { 
       console.error("Chat Fatal Error:", e);
-      // Devolvemos 200 con mensaje de error para que el frontend no muestre pantalla roja
       res.json({ text: `❌ Error interno: ${e.message}. Intenta refrescar.` }); 
   }
 });
