@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. FIREBASE (Persistencia) ---
+// --- 1. FIREBASE ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -21,7 +21,7 @@ try {
         db = getFirestore();
         console.log("🔥 Firebase: CONECTADO");
     } else {
-        console.warn("⚠️ Firebase: Sin credenciales (Modo RAM)");
+        console.warn("⚠️ Firebase: Modo RAM");
     }
 } catch (e) {
     console.error("⚠️ Error Firebase:", e.message);
@@ -30,17 +30,10 @@ try {
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS "A PRUEBA DE TODO" ---
-// Esta lista cubre TODAS las generaciones posibles.
-// Si fallan los 1.5 (que es lo que te pasa), saltará al 'gemini-pro' (1.0) que es viejuno pero fiable.
-const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",      // 1. El Futuro (Experimental)
-    "gemini-1.5-flash",          // 2. El Estándar actual
-    "gemini-1.5-pro",            // 3. El Potente actual
-    "gemini-1.5-flash-002",      // 4. Versión congelada
-    "gemini-1.5-pro-002",        // 5. Versión congelada
-    "gemini-pro"                 // 6. EL SALVAVIDAS (Generación 1.0 - Muy compatible)
-];
+// --- 2. CONFIGURACIÓN DEL MODELO (ESTÁNDAR) ---
+// Usamos SOLO el modelo más estable del mundo ahora mismo.
+// Nada de listas, nada de versiones raras.
+const MODEL_NAME = "gemini-1.5-flash"; 
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -57,33 +50,7 @@ const getApiKey = () => {
   return key;
 };
 
-// HELPER: Iteración Robusta
-async function generateWithFallback(apiKey, promptParts) {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  let lastError = null;
-
-  for (const modelName of MODEL_CANDIDATES) {
-    try {
-      // console.log(`🔄 Intentando con: ${modelName}`);
-      const model = genAI.getGenerativeModel({ model: modelName });
-      
-      const result = await model.generateContent(promptParts);
-      const text = result.response.text();
-      
-      if (text) return text; // ¡ÉXITO!
-      
-    } catch (e) {
-        // Si falla, guardamos el error y probamos el siguiente modelo de la lista
-        console.warn(`⚠️ ${modelName} falló: ${e.message.split(' ')[0]}`);
-        lastError = e;
-    }
-  }
-  
-  // Si llegamos aquí, NINGUNO funcionó. Devuelve mensaje legible.
-  return `⚠️ Error Crítico: Todos los modelos de IA (incluido el legacy) han fallado. Verifica tu API Key. Detalle: ${lastError?.message}`;
-}
-
-app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
+app.get('/', (req, res) => res.json({ status: "Online 🟢", model: MODEL_NAME }));
 
 // 1. CREATE STORE
 app.post('/create-store', (req, res) => {
@@ -96,7 +63,7 @@ app.post('/create-store', (req, res) => {
     if (db) {
         try {
             await db.collection('stores').doc(storeId).set({ name, createdAt: new Date(), files: [], texts: [] });
-        } catch(e) { console.error("Error DB:", e.message); }
+        } catch(e) { console.error("DB Create Error:", e.message); }
     }
   })();
 });
@@ -124,7 +91,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             mimeType: uploadResponse.file.mimeType,
             displayName: req.file.originalname
         };
-    } catch (e) { console.warn("Upload IA falló:", e.message); }
+    } catch (e) { console.warn("IA Upload Warning:", e.message); }
 
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
@@ -154,17 +121,17 @@ app.post('/link-file', (req, res) => {
             await storeRef.update(updates);
             console.log(`💾 Persistido: ${fileName}`);
         }
-      } catch (e) { console.error(`Error BG: ${e.message}`); }
+      } catch (e) { console.error(`BG Save Error: ${e.message}`); }
   })();
 });
 
-// 4. CHAT (ANTI-CRASH)
+// 4. CHAT (VERSIÓN SIMPLE Y ROBUSTA)
 app.post('/chat', async (req, res) => {
   try {
       const { storeId, query } = req.body;
       let storeData = STORES_RAM.get(storeId);
 
-      // Recuperación DB
+      // Recuperación de DB
       if (!storeData && db) {
           try {
               const doc = await db.collection('stores').doc(storeId).get();
@@ -174,19 +141,23 @@ app.post('/chat', async (req, res) => {
                   if (!storeData.texts) storeData.texts = [];
                   STORES_RAM.set(storeId, storeData);
               }
-          } catch (e) { console.error("Error DB:", e.message); }
+          } catch (e) { console.error("DB Read Error:", e.message); }
       }
 
       if (!storeData) return res.json({ text: "⚠️ Cerebro no encontrado. Sube un archivo." });
 
       const apiKey = getApiKey();
-      let promptParts = [];
+      const genAI = new GoogleGenerativeAI(apiKey);
       
+      // USAMOS EL MODELO FIJO
+      const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+
+      let promptParts = [];
       const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
       const validTexts = (storeData.texts || []).filter(t => t && t.text);
 
       if (validFiles.length > 0) {
-          promptParts.push({ text: "Analiza estos documentos:" });
+          promptParts.push({ text: "Documentos adjuntos:" });
           validFiles.slice(-5).forEach(f => {
               promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
           });
@@ -194,17 +165,22 @@ app.post('/chat', async (req, res) => {
       
       if (validTexts.length > 0) {
           const context = validTexts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
-          promptParts.push({ text: `Texto:\n${context}` });
+          promptParts.push({ text: `Texto extraído:\n${context}` });
       }
 
-      promptParts.push({ text: `\nPREGUNTA: ${query}` });
+      promptParts.push({ text: `\nPregunta: ${query}` });
 
-      const answer = await generateWithFallback(apiKey, promptParts);
-      res.json({ text: answer });
+      const result = await model.generateContent(promptParts);
+      res.json({ text: result.response.text() });
       
   } catch (e) { 
-      console.error("Chat Fatal Error:", e);
-      res.json({ text: `❌ Error interno: ${e.message}. Intenta refrescar.` }); 
+      console.error("CRITICAL CHAT ERROR:", e);
+      // Mensaje de error para el usuario
+      if (e.message.includes("404") || e.message.includes("not found")) {
+          res.json({ text: "⚠️ Error 404: El modelo de IA no responde. Es posible que Google esté actualizando el servicio. Intenta de nuevo en 1 minuto." });
+      } else {
+          res.status(500).json({ error: `Error Gemini: ${e.message}` }); 
+      }
   }
 });
 
@@ -233,4 +209,4 @@ app.get('/files', async (req, res) => {
     res.json({ files: [...new Set(fileNames.filter(Boolean))] });
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor Final listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor SIMPLE listo en ${PORT}`));
