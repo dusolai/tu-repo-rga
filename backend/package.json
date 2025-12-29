@@ -1,7 +1,6 @@
 {
-  "name": "backend-cerebro-firebase",
-  "version": "6.0.0",
-  "description": "Backend RAG con Persistencia Firebase",
+  "name": "backend-cerebro-blindado",
+  "version": "8.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

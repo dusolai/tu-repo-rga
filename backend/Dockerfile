@@ -1,13 +1,11 @@
 FROM node:20-slim
 WORKDIR /usr/src/app
 
-# 1. Copiamos configuraciones
 COPY package*.json ./
 
-# 2. INSTALACIÓN NUCLEAR (Incluye firebase-admin)
+# Instalamos TODO manualmente para asegurar que no falta nada
 RUN npm install express multer pdf-parse @google/generative-ai firebase-admin --save
 
-# 3. Copiamos el código
 COPY . .
 
 EXPOSE 8080
