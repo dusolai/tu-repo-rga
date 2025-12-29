@@ -31,17 +31,15 @@ try {
 const STORES_RAM = new Map();
 
 // --- 2. LISTA DE MODELOS "A PRUEBA DE TODO" ---
-// Incluye versiones experimentales, estables, específicas y LEGACY.
-// Si las versiones 1.5 te dan error 404, la versión 'gemini-pro' (1.0) te salvará.
+// Esta lista cubre TODAS las generaciones posibles.
+// Si fallan los 1.5 (que es lo que te pasa), saltará al 'gemini-pro' (1.0) que es viejuno pero fiable.
 const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",      // 1. Prioridad: Experimental (El más listo)
-    "gemini-1.5-flash",          // 2. Estándar Flash
-    "gemini-1.5-flash-latest",   // 3. Puntero Latest (A veces resuelve mejor el 404)
-    "gemini-1.5-flash-001",      // 4. Versión congelada 001
-    "gemini-1.5-flash-002",      // 5. Versión congelada 002
-    "gemini-1.5-pro",            // 6. Estándar Pro
-    "gemini-1.5-pro-latest",     // 7. Pro Latest
-    "gemini-pro"                 // 8. EL SALVAVIDAS (Versión 1.0, vieja pero muy compatible)
+    "gemini-2.0-flash-exp",      // 1. El Futuro (Experimental)
+    "gemini-1.5-flash",          // 2. El Estándar actual
+    "gemini-1.5-pro",            // 3. El Potente actual
+    "gemini-1.5-flash-002",      // 4. Versión congelada
+    "gemini-1.5-pro-002",        // 5. Versión congelada
+    "gemini-pro"                 // 6. EL SALVAVIDAS (Generación 1.0 - Muy compatible)
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -59,31 +57,30 @@ const getApiKey = () => {
   return key;
 };
 
-// HELPER: Iteración robusta
+// HELPER: Iteración Robusta
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
-      // console.log(`🔄 Probando motor: ${modelName}`);
+      // console.log(`🔄 Intentando con: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
       
-      // Intentamos generar
       const result = await model.generateContent(promptParts);
       const text = result.response.text();
       
       if (text) return text; // ¡ÉXITO!
       
     } catch (e) {
-        // Ignoramos el error (sea 404, 500, o lo que sea) y probamos el siguiente
-        // console.warn(`⚠️ Motor ${modelName} falló: ${e.message.split(' ')[0]}`);
+        // Si falla, guardamos el error y probamos el siguiente modelo de la lista
+        console.warn(`⚠️ ${modelName} falló: ${e.message.split(' ')[0]}`);
         lastError = e;
     }
   }
   
-  // Si llegamos aquí, NINGUNO funcionó (ni siquiera el legacy).
-  return `⚠️ Error Total: No he podido conectar con ningún modelo de IA. Verifica tu API Key o la región de tu proyecto en Google Cloud. Último error: ${lastError?.message}`;
+  // Si llegamos aquí, NINGUNO funcionó. Devuelve mensaje legible.
+  return `⚠️ Error Crítico: Todos los modelos de IA (incluido el legacy) han fallado. Verifica tu API Key. Detalle: ${lastError?.message}`;
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
