@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. CONEXIÓN FIREBASE ---
+// --- 1. FIREBASE ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -30,12 +30,12 @@ try {
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS (ALIAS GENÉRICOS) ---
-// Usamos los nombres genéricos para evitar errores 404 por versiones retiradas.
+// --- 2. LISTA DE MODELOS (SOLO ALIAS GENÉRICOS) ---
+// Quitamos versiones numeradas (-001) para evitar Error 404
 const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",      // 1. EL QUE TÚ QUIERES (Experimental)
-    "gemini-1.5-flash",          // 2. EL INDESTRUCTIBLE (Alias genérico, siempre funciona)
-    "gemini-1.5-pro"             // 3. RESPALDO POTENTE (Alias genérico)
+    "gemini-2.0-flash-exp",  // 1. Tu prioridad (Experimental)
+    "gemini-1.5-flash",      // 2. El más estable del mundo (Backup)
+    "gemini-1.5-pro"         // 3. Potencia extra (Backup)
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -53,25 +53,25 @@ const getApiKey = () => {
   return key;
 };
 
-// HELPER: Generación a prueba de fallos
+// Generación: Si falla, prueba el siguiente modelo
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
-      // console.log(`🤖 Probando: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
       const text = result.response.text();
-      if (text) return text; // ¡Éxito!
+      if (text) return text; 
     } catch (e) {
-        console.warn(`⚠️ Modelo ${modelName} saltado: ${e.message.split(' ')[0]}`);
+        console.warn(`⚠️ Modelo ${modelName} falló: ${e.message.split(' ')[0]}`);
         lastError = e;
-        // Si el 2.0 falla, pasará inmediatamente al 1.5-flash sin que te des cuenta
+        // Continuamos al siguiente modelo automáticamente
     }
   }
-  throw new Error(`Todos los modelos fallaron. Revisa tu API Key. (Error final: ${lastError?.message})`);
+  // Si todo falla, devolvemos un texto de error en lugar de lanzar excepción
+  return `⚠️ Error técnico: No he podido conectar con los modelos de IA. Detalles: ${lastError?.message}`;
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
@@ -87,7 +87,7 @@ app.post('/create-store', (req, res) => {
     if (db) {
         try {
             await db.collection('stores').doc(storeId).set({ name, createdAt: new Date(), files: [], texts: [] });
-        } catch(e) { console.error("Error DB Create:", e.message); }
+        } catch(e) { console.error("Error DB:", e.message); }
     }
   })();
 });
@@ -97,7 +97,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
     
-    // Extracción Texto
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf')) {
@@ -105,7 +104,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     } else { extractedText = buffer.toString('utf-8'); }
     extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
 
-    // Subida Google
     let googleFile = null;
     try {
         const apiKey = getApiKey();
@@ -147,58 +145,59 @@ app.post('/link-file', (req, res) => {
             await storeRef.update(updates);
             console.log(`💾 Persistido: ${fileName}`);
         }
-      } catch (e) { console.error(`Error guardado segundo plano: ${e.message}`); }
+      } catch (e) { console.error(`Error BG: ${e.message}`); }
   })();
 });
 
-// 4. CHAT (CON PROTECCIÓN DE DATOS)
+// 4. CHAT (ANTI-CRASH)
 app.post('/chat', async (req, res) => {
-  const { storeId, query } = req.body;
-  let storeData = STORES_RAM.get(storeId);
-
-  // Recuperación DB
-  if (!storeData && db) {
-      try {
-          const doc = await db.collection('stores').doc(storeId).get();
-          if (doc.exists) {
-              storeData = doc.data();
-              if (!storeData.files) storeData.files = [];
-              if (!storeData.texts) storeData.texts = [];
-              STORES_RAM.set(storeId, storeData);
-          }
-      } catch (e) { console.error("Error DB:", e.message); }
-  }
-
-  if (!storeData) return res.json({ text: "⚠️ Cerebro no encontrado. Sube un archivo." });
-
   try {
-    const apiKey = getApiKey();
-    let promptParts = [];
-    
-    // Filtro de seguridad (null check)
-    const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
-    const validTexts = (storeData.texts || []).filter(t => t && t.text);
+      const { storeId, query } = req.body;
+      let storeData = STORES_RAM.get(storeId);
 
-    if (validFiles.length > 0) {
-        promptParts.push({ text: "Analiza estos documentos:" });
-        validFiles.slice(-5).forEach(f => {
-            promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
-        });
-    } 
-    
-    if (validTexts.length > 0) {
-        const context = validTexts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
-        promptParts.push({ text: `Texto extraído:\n${context}` });
-    }
+      // Recuperación DB
+      if (!storeData && db) {
+          try {
+              const doc = await db.collection('stores').doc(storeId).get();
+              if (doc.exists) {
+                  storeData = doc.data();
+                  if (!storeData.files) storeData.files = [];
+                  if (!storeData.texts) storeData.texts = [];
+                  STORES_RAM.set(storeId, storeData);
+              }
+          } catch (e) { console.error("Error DB:", e.message); }
+      }
 
-    promptParts.push({ text: `\nPREGUNTA: ${query}` });
+      if (!storeData) return res.json({ text: "⚠️ Cerebro no encontrado. Sube un archivo." });
 
-    const answer = await generateWithFallback(apiKey, promptParts);
-    res.json({ text: answer });
-    
+      const apiKey = getApiKey();
+      let promptParts = [];
+      
+      const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
+      const validTexts = (storeData.texts || []).filter(t => t && t.text);
+
+      if (validFiles.length > 0) {
+          promptParts.push({ text: "Analiza estos documentos:" });
+          validFiles.slice(-5).forEach(f => {
+              promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
+          });
+      } 
+      
+      if (validTexts.length > 0) {
+          const context = validTexts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
+          promptParts.push({ text: `Texto:\n${context}` });
+      }
+
+      promptParts.push({ text: `\nPREGUNTA: ${query}` });
+
+      // LLAMADA SEGURA (Nunca hace throw)
+      const answer = await generateWithFallback(apiKey, promptParts);
+      res.json({ text: answer });
+      
   } catch (e) { 
-      console.error("Chat Error:", e);
-      res.status(500).json({ error: `Error: ${e.message}` }); 
+      console.error("Chat Fatal Error:", e);
+      // Devolvemos 200 con mensaje de error para que el frontend no muestre pantalla roja
+      res.json({ text: `❌ Error interno: ${e.message}. Intenta refrescar.` }); 
   }
 });
 
@@ -227,4 +226,4 @@ app.get('/files', async (req, res) => {
     res.json({ files: [...new Set(fileNames.filter(Boolean))] });
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Final listo en ${PORT}`));
