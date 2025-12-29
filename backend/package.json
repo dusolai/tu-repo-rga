@@ -1,6 +1,6 @@
 {
-  "name": "backend-cerebro-blindado",
-  "version": "8.0.0",
+  "name": "backend-cerebro-dynamic",
+  "version": "11.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
