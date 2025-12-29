@@ -12,32 +12,31 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. CONEXIÓN FIREBASE (A PRUEBA DE BOMBAS) ---
+// --- 1. FIREBASE (Persistencia) ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
         const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
         admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
         db = getFirestore();
-        console.log("🔥 Firebase: CONECTADO (Modo Persistente)");
+        console.log("🔥 Firebase: CONECTADO");
     } else {
-        console.warn("⚠️ Firebase: Sin credenciales (Modo RAM Volátil)");
+        console.warn("⚠️ Firebase: Sin credenciales (Modo RAM)");
     }
 } catch (e) {
-    console.error("⚠️ Error Firebase (El servidor sigue funcionando en RAM):", e.message);
+    console.error("⚠️ Error Firebase:", e.message);
     db = null;
 }
 
 const STORES_RAM = new Map();
 
-// --- 2. LISTA DE MODELOS "AUTO-ADAPTABLE" ---
-// El sistema probará uno a uno en este orden hasta que uno funcione.
+// --- 2. LISTA DE MODELOS LIMPIA (Sin alias rotos) ---
 const MODEL_CANDIDATES = [ 
-    "gemini-2.0-flash-exp",      // 1º Intento: El futuro (Potente pero experimental)
-    "gemini-1.5-pro-002",        // 2º Intento: La bestia estable
-    "gemini-1.5-flash-002",      // 3º Intento: Rápido actualizado
-    "gemini-1.5-flash",          // 4º Intento: El clásico fiable
-    "gemini-1.5-pro"             // 5º Intento: Respaldo final
+    "gemini-2.0-flash-exp",      // 1. EL FUTURO (Si está disponible)
+    "gemini-1.5-pro-002",        // 2. Potente actualizado
+    "gemini-1.5-flash-002",      // 3. Rápido actualizado
+    "gemini-1.5-flash-001",      // 4. EL INTOCABLE (Siempre funciona)
+    "gemini-1.5-pro-001"         // 5. Respaldo final
 ];
 
 app.use(express.json({ limit: '50mb' }));
@@ -55,29 +54,24 @@ const getApiKey = () => {
   return key;
 };
 
-// --- EL CORAZÓN DEL SISTEMA: GENERACIÓN CON CAÍDA GRACIOSA ---
+// Generación robusta: Si uno falla, prueba el siguiente SIN CRASH
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
   let lastError = null;
 
   for (const modelName of MODEL_CANDIDATES) {
     try {
-      // console.log(`🔄 Probando motor: ${modelName}...`);
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
-      const responseText = result.response.text();
-      
-      if (!responseText) throw new Error("Respuesta vacía de Google");
-      
-      return responseText; // ¡ÉXITO! Salimos del bucle
+      const text = result.response.text();
+      if (text) return text; // ¡Éxito!
     } catch (e) {
-        // Si falla, NO paramos. Anotamos y seguimos al siguiente modelo.
-        console.warn(`⚠️ Motor ${modelName} falló (${e.message.split(' ')[0]}). Cambiando al siguiente...`);
+        console.warn(`⚠️ Modelo ${modelName} saltado: ${e.message.split(' ')[0]}`);
         lastError = e;
     }
   }
-  // Si llegamos aquí, es que han fallado los 5 modelos (muy improbable)
-  throw new Error(`Todos los modelos fallaron. Revisa tu API Key o conexión. Último error: ${lastError?.message}`);
+  // Mensaje de error detallado si TODO falla
+  throw new Error(`Error Gemini: Todos los modelos fallaron. (Intento final: ${lastError?.message})`);
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Conectado" : "RAM" }));
@@ -86,17 +80,14 @@ app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Con
 app.post('/create-store', (req, res) => {
   const name = req.body.name || "Cerebro"; 
   const storeId = `cerebro_${Date.now()}`;
-  
-  // Respuesta instantánea al frontend
   res.json({ name: storeId }); 
 
-  // Trabajo sucio en segundo plano
   (async () => {
     STORES_RAM.set(storeId, { name, files: [], texts: [] });
     if (db) {
         try {
             await db.collection('stores').doc(storeId).set({ name, createdAt: new Date(), files: [], texts: [] });
-        } catch(e) { console.error("Error creando en DB:", e.message); }
+        } catch(e) { console.error("Error DB Create:", e.message); }
     }
   })();
 });
@@ -106,7 +97,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
     
-    // Extracción local
+    // Texto local
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf')) {
@@ -114,7 +105,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     } else { extractedText = buffer.toString('utf-8'); }
     extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
 
-    // Subida a Google (Gestión de errores silenciosa)
+    // Google File API
     let googleFile = null;
     try {
         const apiKey = getApiKey();
@@ -126,7 +117,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             mimeType: uploadResponse.file.mimeType,
             displayName: req.file.originalname
         };
-    } catch (e) { console.warn("Aviso: Falló subida nativa a Google (se usará texto plano):", e.message); }
+    } catch (e) { console.warn("Upload IA falló:", e.message); }
 
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
@@ -134,23 +125,18 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// 3. LINK FILE (ASÍNCRONO PARA EVITAR 503/CORS)
+// 3. LINK FILE
 app.post('/link-file', (req, res) => {
-  // Respondemos OK al instante. El usuario no espera.
   res.json({ success: true });
 
   const { storeId, fileName, extractedText, googleData } = req.body;
-  
-  // Procesamiento en background
   (async () => {
       try {
-        // 1. Guardar en RAM
         if (!STORES_RAM.has(storeId)) STORES_RAM.set(storeId, { name: "Recuperado", files: [], texts: [] });
         const ramStore = STORES_RAM.get(storeId);
         ramStore.texts.push({ fileName, text: extractedText });
         if (googleData && googleData.uri) ramStore.files.push(googleData);
 
-        // 2. Guardar en Firebase (Persistencia)
         if (db) {
             const storeRef = db.collection('stores').doc(storeId);
             const doc = await storeRef.get();
@@ -158,72 +144,67 @@ app.post('/link-file', (req, res) => {
 
             const updates = { texts: FieldValue.arrayUnion({ fileName, text: extractedText }) };
             if (googleData && googleData.uri) updates.files = FieldValue.arrayUnion(googleData);
-            
             await storeRef.update(updates);
-            console.log(`💾 Guardado seguro: ${fileName}`);
+            console.log(`💾 Persistido: ${fileName}`);
         }
-      } catch (e) {
-          console.error(`⚠️ Error guardando en background (No afecta al usuario): ${e.message}`);
-      }
+      } catch (e) { console.error(`Error guardado segundo plano: ${e.message}`); }
   })();
 });
 
-// 4. CHAT (BLINDADO CONTRA FALLOS)
+// 4. CHAT
 app.post('/chat', async (req, res) => {
   const { storeId, query } = req.body;
   let storeData = STORES_RAM.get(storeId);
 
-  // Intentar recuperar de DB si falta en RAM
+  // Recuperación DB
   if (!storeData && db) {
       try {
           const doc = await db.collection('stores').doc(storeId).get();
           if (doc.exists) {
               storeData = doc.data();
-              // SANITIZACIÓN: Aseguramos que los arrays existan para que el código no explote
+              // --- SANITIZACIÓN DE DATOS ---
               if (!storeData.files) storeData.files = [];
               if (!storeData.texts) storeData.texts = [];
-              STORES_RAM.set(storeId, storeData); // Hidratamos RAM
-              console.log("📥 Cerebro recuperado de Firebase");
+              STORES_RAM.set(storeId, storeData);
           }
-      } catch (e) { console.error("Error lectura DB:", e.message); }
+      } catch (e) { console.error("Error DB:", e.message); }
   }
 
-  if (!storeData) return res.json({ text: "⚠️ No encuentro tu memoria. Por favor, sube un documento." });
+  if (!storeData) return res.json({ text: "⚠️ Cerebro no encontrado. Sube un archivo." });
 
   try {
     const apiKey = getApiKey();
     let promptParts = [];
     
-    // Filtramos datos corruptos (nulls o undefineds)
+    // Filtrar datos corruptos
     const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
     const validTexts = (storeData.texts || []).filter(t => t && t.text);
 
     if (validFiles.length > 0) {
-        promptParts.push({ text: "Utiliza estos documentos como fuente principal:" });
-        // Usamos los últimos 5 archivos para dar contexto reciente
+        promptParts.push({ text: "Analiza estos documentos:" });
+        // Últimos 5
         validFiles.slice(-5).forEach(f => {
             promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
         });
     } 
     
     if (validTexts.length > 0) {
-        const context = validTexts.map(t => `--- DOCUMENTO: ${t.fileName} ---\n${t.text}`).join('\n\n');
-        promptParts.push({ text: `Información de texto extraída:\n${context}` });
+        const context = validTexts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
+        promptParts.push({ text: `Texto extraído:\n${context}` });
     }
 
-    promptParts.push({ text: `\nPREGUNTA DEL USUARIO: ${query}` });
+    promptParts.push({ text: `\nPREGUNTA: ${query}` });
 
-    // AQUÍ OCURRE LA MAGIA: Probará modelos hasta que uno funcione
     const answer = await generateWithFallback(apiKey, promptParts);
     res.json({ text: answer });
     
   } catch (e) { 
-      console.error("❌ Error Fatal en Chat:", e);
-      res.status(500).json({ error: `Lo siento, hubo un error técnico: ${e.message}` }); 
+      console.error("Chat Error:", e);
+      res.status(500).json({ error: `Error: ${e.message}` }); 
   }
 });
 
-// 5. LISTAR ARCHIVOS (Seguro)
+// 5. LIST FILES
 app.get('/files', async (req, res) => {
     const { storeId } = req.query;
     if (!storeId) return res.json({ files: [] });
@@ -241,13 +222,11 @@ app.get('/files', async (req, res) => {
 
     if (!storeData) return res.json({ files: [] });
 
-    // Extraemos nombres y eliminamos duplicados/vacíos
     const fileNames = [
         ...(storeData.files || []).map(f => f ? (f.displayName || f.name) : null),
         ...(storeData.texts || []).map(t => t ? t.fileName : null)
     ];
-    const uniqueFiles = [...new Set(fileNames.filter(Boolean))];
-    res.json({ files: uniqueFiles });
+    res.json({ files: [...new Set(fileNames.filter(Boolean))] });
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor BLINDADO listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor listo en ${PORT}`));
