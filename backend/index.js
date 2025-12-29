@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- 1. CONFIGURACIÓN FIREBASE ROBUSTA ---
+// --- 1. CONFIGURACIÓN FIREBASE ---
 let db = null;
 try {
     if (process.env.FIREBASE_CREDENTIALS) {
@@ -29,10 +29,16 @@ try {
 }
 
 const STORES_RAM = new Map();
-// Lista de modelos ordenada por preferencia
-const MODEL_CANDIDATES = [ "gemini-2.0-flash-exp", "gemini-1.5-pro-002", "gemini-1.5-flash-002", "gemini-1.5-flash" ];
 
-app.use(express.json({ limit: '50mb' })); // Aumentado límite por si acaso
+// CAMBIO: Priorizamos modelos estables para que el chat no falle
+const MODEL_CANDIDATES = [ 
+    "gemini-1.5-flash",          // Rápido y estable
+    "gemini-1.5-flash-002",      // Versión nueva
+    "gemini-1.5-pro",            // Más inteligente
+    "gemini-2.0-flash-exp"       // Experimental (último recurso)
+];
+
+app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -49,27 +55,28 @@ const getApiKey = () => {
 
 async function generateWithFallback(apiKey, promptParts) {
   const genAI = new GoogleGenerativeAI(apiKey);
+  let lastError = null;
   for (const modelName of MODEL_CANDIDATES) {
     try {
       const model = genAI.getGenerativeModel({ model: modelName });
       const result = await model.generateContent(promptParts);
       return result.response.text();
-    } catch (e) {}
+    } catch (e) {
+        console.warn(`⚠️ Modelo ${modelName} falló:`, e.message.split(' ')[0]);
+        lastError = e;
+    }
   }
-  throw new Error("Todos los modelos fallaron.");
+  throw new Error(`Todos los modelos fallaron. Último error: ${lastError?.message}`);
 }
 
 app.get('/', (req, res) => res.json({ status: "Online 🟢", firebase: db ? "Activo" : "Inactivo" }));
 
-// 1. CREATE STORE (RESPUESTA INMEDIATA)
+// 1. CREATE STORE
 app.post('/create-store', (req, res) => {
   const name = req.body.name || "Cerebro"; 
   const storeId = `cerebro_${Date.now()}`;
-  
-  // 1. Responder YA al usuario
-  res.json({ name: storeId });
+  res.json({ name: storeId }); // Respuesta inmediata
 
-  // 2. Trabajar en segundo plano
   (async () => {
     STORES_RAM.set(storeId, { name, files: [], texts: [] });
     if (db) {
@@ -80,12 +87,12 @@ app.post('/create-store', (req, res) => {
   })();
 });
 
-// 2. UPLOAD (PROCESAMIENTO SEGURO)
+// 2. UPLOAD
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
     
-    // Extracción de texto local (Rápida)
+    // Extracción Texto
     const buffer = fs.readFileSync(req.file.path);
     let extractedText = "";
     if (req.file.mimetype.includes('pdf')) {
@@ -93,7 +100,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     } else { extractedText = buffer.toString('utf-8'); }
     extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 50000);
 
-    // Subida a Google (Asíncrona pero esperamos para tener la URI)
+    // Subida Google
     let googleFile = null;
     try {
         const apiKey = getApiKey();
@@ -113,24 +120,18 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// 3. LINK FILE (AQUÍ ESTABA EL PROBLEMA - AHORA ES ASÍNCRONO)
+// 3. LINK FILE (ASÍNCRONO)
 app.post('/link-file', (req, res) => {
-  // 1. ¡RESPONDER ÉXITO INMEDIATAMENTE! 
-  // Así el frontend nunca recibe timeout ni error CORS
-  res.json({ success: true });
+  res.json({ success: true }); // Éxito inmediato
 
-  // 2. GUARDAR EN SEGUNDO PLANO
   const { storeId, fileName, extractedText, googleData } = req.body;
-  
   (async () => {
       try {
-        // RAM
         if (!STORES_RAM.has(storeId)) STORES_RAM.set(storeId, { name: "Recuperado", files: [], texts: [] });
         const ramStore = STORES_RAM.get(storeId);
         ramStore.texts.push({ fileName, text: extractedText });
         if (googleData && googleData.uri) ramStore.files.push(googleData);
 
-        // DB (Con protección anti-crash)
         if (db) {
             const storeRef = db.collection('stores').doc(storeId);
             const doc = await storeRef.get();
@@ -143,44 +144,70 @@ app.post('/link-file', (req, res) => {
             console.log(`💾 Persistido: ${fileName}`);
         }
       } catch (e) {
-          console.error(`⚠️ Error guardado segundo plano (Usuario no afectado): ${e.message}`);
+          console.error(`⚠️ Error guardado segundo plano: ${e.message}`);
       }
   })();
 });
 
-// 4. CHAT
+// 4. CHAT (CORREGIDO PARA NO FALLAR AL RECUPERAR)
 app.post('/chat', async (req, res) => {
   const { storeId, query } = req.body;
   let storeData = STORES_RAM.get(storeId);
 
-  // Intentar recuperar si no está en RAM
+  // Intentar recuperar de DB
   if (!storeData && db) {
       try {
           const doc = await db.collection('stores').doc(storeId).get();
           if (doc.exists) {
               storeData = doc.data();
+              // --- PROTECCIÓN CRÍTICA ---
+              // Si los arrays no existen en DB, los inicializamos vacíos para que no explote
+              if (!storeData.files) storeData.files = [];
+              if (!storeData.texts) storeData.texts = [];
+              
               STORES_RAM.set(storeId, storeData);
+              console.log("📥 Cerebro recuperado OK");
           }
-      } catch (e) {}
+      } catch (e) {
+          console.error("Error recuperando DB:", e.message);
+      }
   }
 
-  if (!storeData) return res.json({ text: "⚠️ No encuentro documentos. Sube algo primero." });
+  if (!storeData) return res.json({ text: "⚠️ No encuentro tu cerebro en la base de datos. Prueba a subir archivos de nuevo." });
 
   try {
     const apiKey = getApiKey();
     let promptParts = [];
-    if (storeData.files && storeData.files.length > 0) {
-        promptParts.push({ text: "Contexto:" });
-        storeData.files.slice(-5).forEach(f => promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } }));
-    } else {
-        const context = storeData.texts.map(t => t.text).join('\n\n');
-        promptParts.push({ text: `Contexto:\n${context}` });
+    
+    // Construcción de Prompt Segura
+    const files = storeData.files || [];
+    const texts = storeData.texts || [];
+
+    if (files.length > 0) {
+        promptParts.push({ text: "Contexto (Archivos):" });
+        // Usamos los últimos 3 para no saturar
+        files.slice(-3).forEach(f => {
+            if (f.uri && f.mimeType) {
+                promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
+            }
+        });
+    } 
+    
+    // Siempre añadimos texto como respaldo si hay
+    if (texts.length > 0) {
+        const context = texts.map(t => `--- ${t.fileName} ---\n${t.text}`).join('\n\n');
+        promptParts.push({ text: `Contexto (Texto):\n${context}` });
     }
+
     promptParts.push({ text: `\nPregunta: ${query}` });
 
     const answer = await generateWithFallback(apiKey, promptParts);
     res.json({ text: answer });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    
+  } catch (e) { 
+      console.error("❌ Error Chat:", e);
+      res.status(500).json({ error: `Error generando respuesta: ${e.message}` }); 
+  }
 });
 
 // 5. LIST FILES
@@ -194,6 +221,8 @@ app.get('/files', async (req, res) => {
             const doc = await db.collection('stores').doc(storeId).get();
             if (doc.exists) {
                 storeData = doc.data();
+                if (!storeData.files) storeData.files = [];
+                if (!storeData.texts) storeData.texts = [];
                 STORES_RAM.set(storeId, storeData);
             }
         } catch (e) {}
@@ -205,8 +234,8 @@ app.get('/files', async (req, res) => {
         ...(storeData.files || []).map(f => f.displayName || f.name),
         ...(storeData.texts || []).map(t => t.fileName)
     ];
-    const uniqueFiles = [...new Set(fileNames)];
+    const uniqueFiles = [...new Set(fileNames.filter(Boolean))]; // Filtramos nulos
     res.json({ files: uniqueFiles });
 });
 
-app.listen(PORT, () => console.log(`🚀 Servidor Ultra-Rápido listo en ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Final Blindado listo en ${PORT}`));
