@@ -29,7 +29,7 @@ const STORES_RAM = new Map();
 
 // MODELOS
 const CHAT_MODEL = "gemini-2.0-flash-exp";
-const EMBEDDING_MODEL = "text-embedding-004"; // Para vectores
+const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -47,15 +47,11 @@ const getApiKey = () => {
 };
 
 // ===================================
-// CHUNKING INTELIGENTE (Como NotebookLM)
+// CHUNKING INTELIGENTE
 // ===================================
 function smartChunk(text, fileName, maxChunkSize = 1000) {
     const chunks = [];
-    
-    // Limpiar texto
     text = text.replace(/\s+/g, ' ').trim();
-    
-    // Dividir por párrafos primero
     const paragraphs = text.split(/\n{2,}|\. {2,}/);
     
     let currentChunk = "";
@@ -64,7 +60,6 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
     for (const para of paragraphs) {
         if (!para.trim()) continue;
         
-        // Si el párrafo + chunk actual es muy grande, guardamos el chunk
         if ((currentChunk + para).length > maxChunkSize && currentChunk.length > 0) {
             chunks.push({
                 id: `${fileName}_chunk_${chunkIndex}`,
@@ -79,7 +74,6 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
         
         currentChunk += para + " ";
         
-        // Si el chunk actual supera el tamaño, lo guardamos
         if (currentChunk.length > maxChunkSize) {
             chunks.push({
                 id: `${fileName}_chunk_${chunkIndex}`,
@@ -93,7 +87,6 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
         }
     }
     
-    // Guardar el último chunk
     if (currentChunk.trim().length > 0) {
         chunks.push({
             id: `${fileName}_chunk_${chunkIndex}`,
@@ -109,13 +102,12 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
 }
 
 // ===================================
-// EMBEDDINGS (Vectores para búsqueda semántica)
+// EMBEDDINGS
 // ===================================
 async function generateEmbedding(text, apiKey) {
     try {
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
-        
         const result = await model.embedContent(text);
         return result.embedding.values;
     } catch (e) {
@@ -125,7 +117,7 @@ async function generateEmbedding(text, apiKey) {
 }
 
 // ===================================
-// BÚSQUEDA SEMÁNTICA (Similitud Coseno)
+// BÚSQUEDA SEMÁNTICA
 // ===================================
 function cosineSimilarity(vecA, vecB) {
     if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
@@ -143,9 +135,6 @@ function cosineSimilarity(vecA, vecB) {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// ===================================
-// BÚSQUEDA HÍBRIDA (Keyword + Semántica)
-// ===================================
 function keywordScore(query, text) {
     const queryWords = query.toLowerCase().split(/\s+/);
     const textLower = text.toLowerCase();
@@ -162,39 +151,35 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "14.0.0 - NotebookLM Style",
-    features: ["Smart Chunking", "Embeddings", "Semantic Search", "Hybrid Ranking"]
+    version: "15.0.0 - SYNC FIX",
+    features: ["Smart Chunking", "Embeddings", "Semantic Search", "Synchronous Storage"]
 }));
 
 // 1. CREATE STORE
 app.post('/create-store', async (req, res) => {
-    const name = req.body.name || `Cerebro_${Date.now()}`;
-    const storeId = `cerebro_${Date.now()}`;
-    
-    STORES_RAM.set(storeId, { 
-        name, 
-        files: [],
-        chunks: [],
-        embeddings: [],
-        createdAt: new Date() 
-    });
-    
-    if (db) {
-        try {
-            await db.collection('stores').doc(storeId).set({
-                name,
-                files: [],
-                chunks: [],
-                embeddings: [],
-                createdAt: new Date()
-            });
-        } catch (e) {
-            console.error("Error DB:", e.message);
+    try {
+        const name = req.body.name || `Cerebro_${Date.now()}`;
+        const storeId = `cerebro_${Date.now()}`;
+        
+        const storeData = { 
+            name, 
+            files: [],
+            chunks: [],
+            createdAt: new Date() 
+        };
+        
+        STORES_RAM.set(storeId, storeData);
+        
+        if (db) {
+            await db.collection('stores').doc(storeId).set(storeData);
         }
+        
+        console.log(`✅ Store creado: ${storeId}`);
+        res.json({ name: storeId });
+    } catch (error) {
+        console.error("Error creando store:", error);
+        res.status(500).json({ error: error.message });
     }
-    
-    console.log(`✅ Store creado: ${storeId}`);
-    res.json({ name: storeId });
 });
 
 // 2. UPLOAD CON CHUNKING Y EMBEDDINGS
@@ -207,7 +192,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         
         console.log(`📤 Procesando: ${fileName}`);
         
-        // 1. Extraer texto
         const buffer = fs.readFileSync(req.file.path);
         let extractedText = "";
         
@@ -218,10 +202,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             extractedText = buffer.toString('utf-8');
         }
         
-        // 2. Chunking inteligente
         const chunks = smartChunk(extractedText, fileName);
         
-        // 3. Generar embeddings para cada chunk
         console.log(`🧮 Generando embeddings para ${chunks.length} chunks...`);
         const chunksWithEmbeddings = [];
         
@@ -231,12 +213,9 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 ...chunk,
                 embedding
             });
-            
-            // Pequeña pausa para no saturar la API
             await new Promise(r => setTimeout(r, 100));
         }
         
-        // Limpiar archivo temporal
         if (fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
         }
@@ -246,7 +225,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         res.json({
             file: {
                 fileName,
-                extractedText: extractedText.substring(0, 500), // Solo preview
+                extractedText: extractedText.substring(0, 500),
                 chunkCount: chunks.length,
                 chunks: chunksWithEmbeddings
             }
@@ -257,85 +236,157 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// 3. LINK FILE (Guardar chunks con embeddings)
+// 3. LINK FILE - AHORA COMPLETAMENTE SÍNCRONO
 app.post('/link-file', async (req, res) => {
-    res.json({ success: true });
-    
-    const { storeId, fileName, chunks } = req.body;
-    
-    (async () => {
-        try {
-            if (!STORES_RAM.has(storeId)) {
-                STORES_RAM.set(storeId, { name: "Recuperado", files: [], chunks: [], embeddings: [] });
-            }
-            
-            const store = STORES_RAM.get(storeId);
-            
-            // Guardar chunks
-            store.files.push({ fileName, chunkCount: chunks.length, linkedAt: new Date() });
-            store.chunks.push(...chunks);
-            
-            console.log(`💾 Guardados ${chunks.length} chunks para ${fileName}`);
+    try {
+        const { storeId, fileName, chunks } = req.body;
+        
+        console.log(`🔗 Vinculando ${fileName} con ${chunks?.length || 0} chunks a ${storeId}`);
+        
+        if (!storeId || !fileName || !chunks || !Array.isArray(chunks)) {
+            return res.status(400).json({ 
+                error: 'Datos inválidos',
+                received: { storeId: !!storeId, fileName: !!fileName, chunks: chunks?.length }
+            });
+        }
+        
+        // Recuperar o crear store
+        let store = STORES_RAM.get(storeId);
+        
+        if (!store) {
+            console.log(`⚠️ Store ${storeId} no existe en RAM, recuperando/creando...`);
             
             if (db) {
-                try {
-                    await db.collection('stores').doc(storeId).update({
-                        files: FieldValue.arrayUnion({ fileName, chunkCount: chunks.length }),
-                        chunks: FieldValue.arrayUnion(...chunks)
-                    });
-                } catch (e) {
-                    console.error("Error guardando en DB:", e.message);
+                const doc = await db.collection('stores').doc(storeId).get();
+                if (doc.exists) {
+                    store = doc.data();
+                    console.log(`📥 Store recuperado de Firebase`);
                 }
             }
-        } catch (e) {
-            console.error("Error en link:", e.message);
+            
+            if (!store) {
+                store = { 
+                    name: "Recuperado", 
+                    files: [], 
+                    chunks: [],
+                    createdAt: new Date()
+                };
+                console.log(`🆕 Store creado en RAM`);
+            }
+            
+            STORES_RAM.set(storeId, store);
         }
-    })();
+        
+        // Guardar en RAM (SÍNCRONO)
+        const fileEntry = { 
+            fileName, 
+            chunkCount: chunks.length, 
+            linkedAt: new Date() 
+        };
+        
+        store.files.push(fileEntry);
+        store.chunks.push(...chunks);
+        
+        console.log(`💾 RAM: Guardados ${chunks.length} chunks. Total: ${store.chunks.length} chunks`);
+        
+        // Guardar en Firebase (SÍNCRONO)
+        if (db) {
+            try {
+                await db.collection('stores').doc(storeId).update({
+                    files: FieldValue.arrayUnion(fileEntry),
+                    chunks: FieldValue.arrayUnion(...chunks)
+                });
+                console.log(`🔥 Firebase: Chunks guardados`);
+            } catch (dbError) {
+                console.error("⚠️ Error guardando en Firebase (continuando):", dbError.message);
+            }
+        }
+        
+        // AHORA SÍ respondemos
+        res.json({ 
+            success: true,
+            stored: {
+                fileName,
+                chunkCount: chunks.length,
+                totalChunksInStore: store.chunks.length,
+                totalFilesInStore: store.files.length
+            }
+        });
+        
+        console.log(`✅ Link completado: ${fileName}`);
+        
+    } catch (error) {
+        console.error("❌ Error en link-file:", error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
-// 4. CHAT CON BÚSQUEDA SEMÁNTICA HÍBRIDA
+// 4. CHAT CON DEBUG MEJORADO
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
         const apiKey = getApiKey();
         
-        console.log(`💬 Pregunta: "${query}"`);
+        console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
         
         // Recuperar store
         let store = STORES_RAM.get(storeId);
+        
         if (!store && db) {
+            console.log(`📥 Recuperando store de Firebase...`);
             try {
                 const doc = await db.collection('stores').doc(storeId).get();
                 if (doc.exists) {
                     store = doc.data();
                     STORES_RAM.set(storeId, store);
+                    console.log(`✅ Store recuperado: ${store.chunks?.length || 0} chunks`);
                 }
             } catch (e) {
                 console.error("Error leyendo DB:", e.message);
             }
         }
         
-        if (!store || !store.chunks || store.chunks.length === 0) {
+        // DEBUG: Estado del store
+        console.log(`📊 Estado del store:`, {
+            exists: !!store,
+            files: store?.files?.length || 0,
+            chunks: store?.chunks?.length || 0
+        });
+        
+        if (!store) {
+            console.log(`❌ Store ${storeId} no encontrado`);
             return res.json({ 
                 text: "⚠️ No hay documentos. Sube alguno primero.",
-                sources: []
+                sources: [],
+                debug: { error: "Store no encontrado" }
+            });
+        }
+        
+        if (!store.chunks || store.chunks.length === 0) {
+            console.log(`❌ Store ${storeId} existe pero no tiene chunks`);
+            return res.json({ 
+                text: "⚠️ No hay documentos indexados. Intenta subir los archivos de nuevo.",
+                sources: [],
+                debug: { 
+                    storeExists: true,
+                    filesCount: store.files?.length || 0,
+                    chunksCount: 0 
+                }
             });
         }
         
         console.log(`📊 Buscando en ${store.chunks.length} chunks`);
         
-        // 1. Generar embedding de la pregunta
+        // Generar embedding de la pregunta
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
-        // 2. Búsqueda híbrida (semántica + keyword)
+        // Búsqueda híbrida
         const scoredChunks = store.chunks.map(chunk => {
             const semanticScore = queryEmbedding && chunk.embedding 
                 ? cosineSimilarity(queryEmbedding, chunk.embedding)
                 : 0;
             
             const keywordScoreVal = keywordScore(query, chunk.text);
-            
-            // Combinar scores (70% semántico, 30% keyword)
             const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
             
             return {
@@ -346,22 +397,19 @@ app.post('/chat', async (req, res) => {
             };
         });
         
-        // 3. Ordenar por score y tomar top 5
         const topChunks = scoredChunks
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
-        console.log(`🎯 Top 5 chunks encontrados:`);
+        console.log(`🎯 Top 5 chunks:`);
         topChunks.forEach((c, i) => {
-            console.log(`  ${i + 1}. ${c.fileName} (Score: ${c.finalScore.toFixed(3)}) - "${c.text.substring(0, 50)}..."`);
+            console.log(`  ${i + 1}. ${c.fileName} (Score: ${c.finalScore.toFixed(3)})`);
         });
         
-        // 4. Construir contexto
         const context = topChunks
             .map(c => `[Fuente: ${c.fileName}, Chunk ${c.index}]\n${c.text}`)
             .join('\n\n---\n\n');
         
-        // 5. Generar respuesta con el modelo
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
@@ -394,7 +442,9 @@ Respuesta:`;
                 score: c.finalScore.toFixed(3)
             })),
             debug: {
+                storeId,
                 totalChunks: store.chunks.length,
+                totalFiles: store.files.length,
                 topScores: topChunks.map(c => c.finalScore.toFixed(3))
             }
         });
@@ -403,7 +453,8 @@ Respuesta:`;
         console.error("Error en chat:", error);
         res.json({ 
             text: `❌ Error: ${error.message}`,
-            sources: []
+            sources: [],
+            debug: { error: error.message }
         });
     }
 });
@@ -412,22 +463,19 @@ Respuesta:`;
 app.get('/files', async (req, res) => {
     try {
         const { storeId } = req.query;
-        if (!storeId) return res.json({ files: [] });
+        if (!storeId) return res.json({ files: [], totalChunks: 0 });
         
         let store = STORES_RAM.get(storeId);
+        
         if (!store && db) {
-            try {
-                const doc = await db.collection('stores').doc(storeId).get();
-                if (doc.exists) {
-                    store = doc.data();
-                    STORES_RAM.set(storeId, store);
-                }
-            } catch (e) {
-                console.error("Error leyendo archivos:", e.message);
+            const doc = await db.collection('stores').doc(storeId).get();
+            if (doc.exists) {
+                store = doc.data();
+                STORES_RAM.set(storeId, store);
             }
         }
         
-        if (!store) return res.json({ files: [] });
+        if (!store) return res.json({ files: [], totalChunks: 0 });
         
         const fileNames = (store.files || [])
             .map(f => f.fileName)
@@ -438,7 +486,8 @@ app.get('/files', async (req, res) => {
             totalChunks: store.chunks?.length || 0
         });
     } catch (error) {
-        res.json({ files: [] });
+        console.error("Error en /files:", error);
+        res.json({ files: [], totalChunks: 0 });
     }
 });
 
@@ -448,10 +497,10 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v14.0.0 - NotebookLM Style`);
+  console.log(`🚀 Backend v15.0.0 - SYNC FIX`);
   console.log(`📍 Puerto: ${PORT}`);
   console.log(`🤖 Modelo Chat: ${CHAT_MODEL}`);
   console.log(`🧮 Modelo Embeddings: ${EMBEDDING_MODEL}`);
-  console.log(`🔥 Firebase: ${db ? 'ACTIVO' : 'RAM'}`);
-  console.log(`✨ Features: Smart Chunking + Semantic Search + Hybrid Ranking`);
+  console.log(`🔥 Firebase: ${db ? 'ACTIVO' : 'RAM ONLY'}`);
+  console.log(`✨ Features: Synchronous Storage + Debug Logs`);
 });
