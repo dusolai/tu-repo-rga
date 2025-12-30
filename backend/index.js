@@ -27,9 +27,60 @@ try {
 
 const STORES_RAM = new Map();
 
-// MODELOS - ACTUALIZADO PARA EVITAR LÍMITES DE CUOTA
-const CHAT_MODEL = "gemini-1.5-flash-002"; // Modelo estable con mejor cuota
-const EMBEDDING_MODEL = "text-embedding-004";
+// ===================================
+// SISTEMA DE MODELOS CON FALLBACK AUTOMÁTICO
+// ===================================
+const MODEL_CACHE = {
+    chat: null,
+    lastChecked: null
+};
+
+// Lista de modelos en orden de preferencia (del mejor al más básico)
+const CHAT_MODELS_PRIORITY = [
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro-latest",
+    "gemini-1.5-pro",
+    "gemini-pro"
+];
+
+const EMBEDDING_MODEL = "text-embedding-004"; // Este es estable
+
+async function getWorkingChatModel(apiKey) {
+    // Si tenemos un modelo cacheado que funciona, usarlo
+    const cacheAge = Date.now() - (MODEL_CACHE.lastChecked || 0);
+    if (MODEL_CACHE.chat && cacheAge < 3600000) { // Cache válido por 1 hora
+        return MODEL_CACHE.chat;
+    }
+    
+    console.log("🔍 Buscando modelo de chat disponible...");
+    const genAI = new GoogleGenerativeAI(apiKey);
+    
+    // Probar cada modelo en orden de prioridad
+    for (const modelName of CHAT_MODELS_PRIORITY) {
+        try {
+            console.log(`   Probando: ${modelName}...`);
+            const model = genAI.getGenerativeModel({ model: modelName });
+            
+            // Probar con una consulta simple
+            const result = await model.generateContent("Test");
+            const text = result.response.text();
+            
+            if (text) {
+                console.log(`   ✅ Modelo funcionando: ${modelName}`);
+                MODEL_CACHE.chat = modelName;
+                MODEL_CACHE.lastChecked = Date.now();
+                return modelName;
+            }
+        } catch (error) {
+            console.log(`   ❌ ${modelName} no disponible: ${error.message.substring(0, 100)}`);
+            continue;
+        }
+    }
+    
+    // Si ninguno funciona, usar el último conocido o tirar error
+    throw new Error("No se encontró ningún modelo de chat disponible. Verifica tu API key.");
+}
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -113,8 +164,9 @@ async function generateEmbedding(text, apiKey, retries = 3) {
             return result.embedding.values;
         } catch (e) {
             if (e.message.includes('429') && attempt < retries) {
-                console.log(`⏳ Esperando 2s antes de reintentar embedding (intento ${attempt}/${retries})...`);
-                await new Promise(r => setTimeout(r, 2000));
+                const waitTime = attempt * 2000;
+                console.log(`⏳ Esperando ${waitTime/1000}s antes de reintentar embedding (intento ${attempt}/${retries})...`);
+                await new Promise(r => setTimeout(r, waitTime));
                 continue;
             }
             console.error(`Error generando embedding (intento ${attempt}/${retries}):`, e.message);
@@ -159,9 +211,13 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "16.0.0 - QUOTA FIX",
-    features: ["Smart Chunking", "Embeddings", "Semantic Search", "Synchronous Storage", "Retry Logic"],
-    models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL }
+    version: "17.0.0 - AUTO MODEL DETECTION",
+    features: ["Auto Model Detection", "Smart Chunking", "Embeddings", "Semantic Search"],
+    models: { 
+        chat: MODEL_CACHE.chat || "Auto-detect on first request",
+        embedding: EMBEDDING_MODEL,
+        chatPriority: CHAT_MODELS_PRIORITY
+    }
 }));
 
 // 1. CREATE STORE
@@ -222,7 +278,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 ...chunk,
                 embedding
             });
-            // Pausa entre embeddings para evitar límites
             await new Promise(r => setTimeout(r, 200));
         }
         
@@ -246,7 +301,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// 3. LINK FILE - COMPLETAMENTE SÍNCRONO
+// 3. LINK FILE
 app.post('/link-file', async (req, res) => {
     try {
         const { storeId, fileName, chunks } = req.body;
@@ -263,44 +318,24 @@ app.post('/link-file', async (req, res) => {
         let store = STORES_RAM.get(storeId);
         
         if (!store) {
-            console.log(`⚠️ Store ${storeId} no existe en RAM, recuperando/creando...`);
-            
             if (db) {
                 const doc = await db.collection('stores').doc(storeId).get();
                 if (doc.exists) {
                     store = doc.data();
-                    console.log(`📥 Store recuperado de Firebase`);
                 }
             }
             
             if (!store) {
-                store = { 
-                    name: "Recuperado", 
-                    files: [], 
-                    chunks: [],
-                    createdAt: new Date()
-                };
-                console.log(`🆕 Store creado en RAM`);
+                store = { name: "Recuperado", files: [], chunks: [], createdAt: new Date() };
             }
             
             STORES_RAM.set(storeId, store);
         }
         
-        // CRÍTICO: Asegurar que los arrays existen
-        if (!Array.isArray(store.files)) {
-            console.log(`⚠️ Inicializando store.files (era ${typeof store.files})`);
-            store.files = [];
-        }
-        if (!Array.isArray(store.chunks)) {
-            console.log(`⚠️ Inicializando store.chunks (era ${typeof store.chunks})`);
-            store.chunks = [];
-        }
+        if (!Array.isArray(store.files)) store.files = [];
+        if (!Array.isArray(store.chunks)) store.chunks = [];
         
-        const fileEntry = { 
-            fileName, 
-            chunkCount: chunks.length, 
-            linkedAt: new Date() 
-        };
+        const fileEntry = { fileName, chunkCount: chunks.length, linkedAt: new Date() };
         
         store.files.push(fileEntry);
         store.chunks.push(...chunks);
@@ -313,9 +348,8 @@ app.post('/link-file', async (req, res) => {
                     files: FieldValue.arrayUnion(fileEntry),
                     chunks: FieldValue.arrayUnion(...chunks)
                 });
-                console.log(`🔥 Firebase: Chunks guardados`);
             } catch (dbError) {
-                console.error("⚠️ Error guardando en Firebase (continuando):", dbError.message);
+                console.error("⚠️ Error guardando en Firebase:", dbError.message);
             }
         }
         
@@ -337,62 +371,39 @@ app.post('/link-file', async (req, res) => {
     }
 });
 
-// 4. CHAT CON RETRY Y FALLBACK
+// 4. CHAT CON AUTO-DETECCIÓN DE MODELO
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
         const apiKey = getApiKey();
         
-        console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
+        console.log(`💬 Pregunta: "${query}"`);
         
         let store = STORES_RAM.get(storeId);
         
         if (!store && db) {
-            console.log(`📥 Recuperando store de Firebase...`);
             try {
                 const doc = await db.collection('stores').doc(storeId).get();
                 if (doc.exists) {
                     store = doc.data();
                     STORES_RAM.set(storeId, store);
-                    console.log(`✅ Store recuperado: ${store.chunks?.length || 0} chunks`);
                 }
             } catch (e) {
                 console.error("Error leyendo DB:", e.message);
             }
         }
         
-        console.log(`📊 Estado del store:`, {
-            exists: !!store,
-            files: store?.files?.length || 0,
-            chunks: store?.chunks?.length || 0
-        });
-        
-        if (!store) {
+        if (!store || !store.chunks || store.chunks.length === 0) {
             return res.json({ 
-                text: "⚠️ No hay documentos. Sube alguno primero.",
-                sources: [],
-                debug: { error: "Store no encontrado" }
-            });
-        }
-        
-        if (!store.chunks || store.chunks.length === 0) {
-            return res.json({ 
-                text: "⚠️ No hay documentos indexados. Intenta subir los archivos de nuevo.",
-                sources: [],
-                debug: { 
-                    storeExists: true,
-                    filesCount: store.files?.length || 0,
-                    chunksCount: 0 
-                }
+                text: "⚠️ No hay documentos indexados.",
+                sources: []
             });
         }
         
         console.log(`📊 Buscando en ${store.chunks.length} chunks`);
         
-        // Generar embedding de la pregunta CON RETRY
         const queryEmbedding = await generateEmbedding(query, apiKey, 3);
         
-        // Búsqueda híbrida
         const scoredChunks = store.chunks.map(chunk => {
             const semanticScore = queryEmbedding && chunk.embedding 
                 ? cosineSimilarity(queryEmbedding, chunk.embedding)
@@ -401,46 +412,34 @@ app.post('/chat', async (req, res) => {
             const keywordScoreVal = keywordScore(query, chunk.text);
             const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
             
-            return {
-                ...chunk,
-                semanticScore,
-                keywordScore: keywordScoreVal,
-                finalScore
-            };
+            return { ...chunk, finalScore };
         });
         
         const topChunks = scoredChunks
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
-        console.log(`🎯 Top 5 chunks:`);
-        topChunks.forEach((c, i) => {
-            console.log(`  ${i + 1}. ${c.fileName} (Score: ${c.finalScore.toFixed(3)})`);
-        });
+        console.log(`🎯 Top 5 chunks encontrados`);
         
         const context = topChunks
-            .map(c => `[Fuente: ${c.fileName}, Chunk ${c.index}]\n${c.text}`)
+            .map(c => `[Fuente: ${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
+        // OBTENER MODELO DISPONIBLE AUTOMÁTICAMENTE
+        const chatModel = await getWorkingChatModel(apiKey);
+        console.log(`🤖 Usando modelo: ${chatModel}`);
         
-        const prompt = `Contexto extraído de los documentos:
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: chatModel });
+        
+        const prompt = `Contexto:
 
 ${context}
 
-Pregunta del usuario: ${query}
+Pregunta: ${query}
 
-Instrucciones:
-1. Responde SOLO basándote en el contexto proporcionado
-2. Si la información está en el contexto, responde con confianza
-3. Cita específicamente de qué fuente/chunk viene cada información
-4. Si NO está en el contexto, di claramente "No encuentro esa información en los documentos"
-5. Sé preciso y detallado
+Responde basándote SOLO en el contexto. Si no está la información, dilo claramente.`;
 
-Respuesta:`;
-
-        // RETRY en generación con espera progresiva
         let answer = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
             try {
@@ -449,57 +448,62 @@ Respuesta:`;
                 break;
             } catch (error) {
                 if (error.message.includes('429') && attempt < 3) {
-                    const waitTime = attempt * 3000; // 3s, 6s, 9s
-                    console.log(`⏳ Cuota excedida, esperando ${waitTime/1000}s... (intento ${attempt}/3)`);
+                    const waitTime = attempt * 3000;
+                    console.log(`⏳ Esperando ${waitTime/1000}s... (intento ${attempt}/3)`);
                     await new Promise(r => setTimeout(r, waitTime));
                     continue;
                 }
+                
+                // Si falla por modelo, invalidar cache y reintentar
+                if (error.message.includes('404') || error.message.includes('not found')) {
+                    console.log(`⚠️ Modelo ${chatModel} ya no disponible, buscando alternativa...`);
+                    MODEL_CACHE.chat = null;
+                    MODEL_CACHE.lastChecked = null;
+                    
+                    if (attempt < 3) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        continue;
+                    }
+                }
+                
                 throw error;
             }
         }
         
         if (!answer) {
             return res.json({
-                text: "⚠️ No se pudo generar respuesta debido a límites de cuota. Por favor, espera unos segundos e intenta de nuevo.",
-                sources: [],
-                debug: { error: "Quota exceeded, retry later" }
+                text: "⚠️ No se pudo generar respuesta. Intenta de nuevo en unos segundos.",
+                sources: []
             });
         }
         
-        console.log(`✅ Respuesta generada (${answer.length} chars)`);
+        console.log(`✅ Respuesta generada`);
         
         res.json({
             text: answer,
             sources: topChunks.map(c => ({
                 fileName: c.fileName,
-                chunkIndex: c.index,
-                preview: c.text.substring(0, 200) + "...",
                 score: c.finalScore.toFixed(3)
             })),
             debug: {
-                storeId,
-                totalChunks: store.chunks.length,
-                totalFiles: store.files.length,
-                topScores: topChunks.map(c => c.finalScore.toFixed(3))
+                model: chatModel,
+                totalChunks: store.chunks.length
             }
         });
         
     } catch (error) {
         console.error("Error en chat:", error);
         
-        // Respuesta amigable para errores de cuota
         if (error.message.includes('429')) {
             return res.json({ 
-                text: `⚠️ Has alcanzado el límite de uso del modelo. Por favor, espera 1 minuto e intenta de nuevo.\n\nEsto es temporal y se resolverá automáticamente.`,
-                sources: [],
-                debug: { error: "Rate limit exceeded - wait 60 seconds" }
+                text: `⚠️ Límite de uso alcanzado. Espera 1 minuto.`,
+                sources: []
             });
         }
         
         res.json({ 
             text: `❌ Error: ${error.message}`,
-            sources: [],
-            debug: { error: error.message }
+            sources: []
         });
     }
 });
@@ -522,16 +526,13 @@ app.get('/files', async (req, res) => {
         
         if (!store) return res.json({ files: [], totalChunks: 0 });
         
-        const fileNames = (store.files || [])
-            .map(f => f.fileName)
-            .filter(Boolean);
+        const fileNames = (store.files || []).map(f => f.fileName).filter(Boolean);
         
         res.json({ 
             files: fileNames,
             totalChunks: store.chunks?.length || 0
         });
     } catch (error) {
-        console.error("Error en /files:", error);
         res.json({ files: [], totalChunks: 0 });
     }
 });
@@ -542,10 +543,11 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v16.0.0 - QUOTA FIX`);
+  console.log(`🚀 Backend v17.0.0 - AUTO MODEL DETECTION`);
   console.log(`📍 Puerto: ${PORT}`);
-  console.log(`🤖 Modelo Chat: ${CHAT_MODEL}`);
+  console.log(`🤖 Modelos disponibles (en orden):`);
+  CHAT_MODELS_PRIORITY.forEach((m, i) => console.log(`   ${i+1}. ${m}`));
   console.log(`🧮 Modelo Embeddings: ${EMBEDDING_MODEL}`);
   console.log(`🔥 Firebase: ${db ? 'ACTIVO' : 'RAM ONLY'}`);
-  console.log(`✨ Features: Retry Logic + Rate Limit Handling`);
+  console.log(`✨ Sistema de auto-detección activado`);
 });
