@@ -27,8 +27,8 @@ try {
 
 const STORES_RAM = new Map();
 
-// MODELOS
-const CHAT_MODEL = "gemini-2.0-flash-exp";
+// MODELOS - ACTUALIZADO PARA EVITAR LÍMITES DE CUOTA
+const CHAT_MODEL = "gemini-1.5-flash-002"; // Modelo estable con mejor cuota
 const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
@@ -102,18 +102,26 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
 }
 
 // ===================================
-// EMBEDDINGS
+// EMBEDDINGS CON RETRY
 // ===================================
-async function generateEmbedding(text, apiKey) {
-    try {
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
-        const result = await model.embedContent(text);
-        return result.embedding.values;
-    } catch (e) {
-        console.error("Error generando embedding:", e.message);
-        return null;
+async function generateEmbedding(text, apiKey, retries = 3) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const genAI = new GoogleGenerativeAI(apiKey);
+            const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
+            const result = await model.embedContent(text);
+            return result.embedding.values;
+        } catch (e) {
+            if (e.message.includes('429') && attempt < retries) {
+                console.log(`⏳ Esperando 2s antes de reintentar embedding (intento ${attempt}/${retries})...`);
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+            console.error(`Error generando embedding (intento ${attempt}/${retries}):`, e.message);
+            if (attempt === retries) return null;
+        }
     }
+    return null;
 }
 
 // ===================================
@@ -151,8 +159,9 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "15.0.0 - SYNC FIX",
-    features: ["Smart Chunking", "Embeddings", "Semantic Search", "Synchronous Storage"]
+    version: "16.0.0 - QUOTA FIX",
+    features: ["Smart Chunking", "Embeddings", "Semantic Search", "Synchronous Storage", "Retry Logic"],
+    models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL }
 }));
 
 // 1. CREATE STORE
@@ -213,7 +222,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
                 ...chunk,
                 embedding
             });
-            await new Promise(r => setTimeout(r, 100));
+            // Pausa entre embeddings para evitar límites
+            await new Promise(r => setTimeout(r, 200));
         }
         
         if (fs.existsSync(req.file.path)) {
@@ -236,7 +246,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// 3. LINK FILE - AHORA COMPLETAMENTE SÍNCRONO
+// 3. LINK FILE - COMPLETAMENTE SÍNCRONO
 app.post('/link-file', async (req, res) => {
     try {
         const { storeId, fileName, chunks } = req.body;
@@ -250,7 +260,6 @@ app.post('/link-file', async (req, res) => {
             });
         }
         
-        // Recuperar o crear store
         let store = STORES_RAM.get(storeId);
         
         if (!store) {
@@ -287,7 +296,6 @@ app.post('/link-file', async (req, res) => {
             store.chunks = [];
         }
         
-        // Guardar en RAM (SÍNCRONO)
         const fileEntry = { 
             fileName, 
             chunkCount: chunks.length, 
@@ -299,7 +307,6 @@ app.post('/link-file', async (req, res) => {
         
         console.log(`💾 RAM: Guardados ${chunks.length} chunks. Total: ${store.chunks.length} chunks`);
         
-        // Guardar en Firebase (SÍNCRONO)
         if (db) {
             try {
                 await db.collection('stores').doc(storeId).update({
@@ -312,7 +319,6 @@ app.post('/link-file', async (req, res) => {
             }
         }
         
-        // AHORA SÍ respondemos
         res.json({ 
             success: true,
             stored: {
@@ -331,7 +337,7 @@ app.post('/link-file', async (req, res) => {
     }
 });
 
-// 4. CHAT CON DEBUG MEJORADO
+// 4. CHAT CON RETRY Y FALLBACK
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
@@ -339,7 +345,6 @@ app.post('/chat', async (req, res) => {
         
         console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
         
-        // Recuperar store
         let store = STORES_RAM.get(storeId);
         
         if (!store && db) {
@@ -356,7 +361,6 @@ app.post('/chat', async (req, res) => {
             }
         }
         
-        // DEBUG: Estado del store
         console.log(`📊 Estado del store:`, {
             exists: !!store,
             files: store?.files?.length || 0,
@@ -364,7 +368,6 @@ app.post('/chat', async (req, res) => {
         });
         
         if (!store) {
-            console.log(`❌ Store ${storeId} no encontrado`);
             return res.json({ 
                 text: "⚠️ No hay documentos. Sube alguno primero.",
                 sources: [],
@@ -373,7 +376,6 @@ app.post('/chat', async (req, res) => {
         }
         
         if (!store.chunks || store.chunks.length === 0) {
-            console.log(`❌ Store ${storeId} existe pero no tiene chunks`);
             return res.json({ 
                 text: "⚠️ No hay documentos indexados. Intenta subir los archivos de nuevo.",
                 sources: [],
@@ -387,8 +389,8 @@ app.post('/chat', async (req, res) => {
         
         console.log(`📊 Buscando en ${store.chunks.length} chunks`);
         
-        // Generar embedding de la pregunta
-        const queryEmbedding = await generateEmbedding(query, apiKey);
+        // Generar embedding de la pregunta CON RETRY
+        const queryEmbedding = await generateEmbedding(query, apiKey, 3);
         
         // Búsqueda híbrida
         const scoredChunks = store.chunks.map(chunk => {
@@ -438,8 +440,31 @@ Instrucciones:
 
 Respuesta:`;
 
-        const result = await model.generateContent(prompt);
-        const answer = result.response.text();
+        // RETRY en generación con espera progresiva
+        let answer = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const result = await model.generateContent(prompt);
+                answer = result.response.text();
+                break;
+            } catch (error) {
+                if (error.message.includes('429') && attempt < 3) {
+                    const waitTime = attempt * 3000; // 3s, 6s, 9s
+                    console.log(`⏳ Cuota excedida, esperando ${waitTime/1000}s... (intento ${attempt}/3)`);
+                    await new Promise(r => setTimeout(r, waitTime));
+                    continue;
+                }
+                throw error;
+            }
+        }
+        
+        if (!answer) {
+            return res.json({
+                text: "⚠️ No se pudo generar respuesta debido a límites de cuota. Por favor, espera unos segundos e intenta de nuevo.",
+                sources: [],
+                debug: { error: "Quota exceeded, retry later" }
+            });
+        }
         
         console.log(`✅ Respuesta generada (${answer.length} chars)`);
         
@@ -461,6 +486,16 @@ Respuesta:`;
         
     } catch (error) {
         console.error("Error en chat:", error);
+        
+        // Respuesta amigable para errores de cuota
+        if (error.message.includes('429')) {
+            return res.json({ 
+                text: `⚠️ Has alcanzado el límite de uso del modelo. Por favor, espera 1 minuto e intenta de nuevo.\n\nEsto es temporal y se resolverá automáticamente.`,
+                sources: [],
+                debug: { error: "Rate limit exceeded - wait 60 seconds" }
+            });
+        }
+        
         res.json({ 
             text: `❌ Error: ${error.message}`,
             sources: [],
@@ -507,10 +542,10 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v15.0.0 - SYNC FIX`);
+  console.log(`🚀 Backend v16.0.0 - QUOTA FIX`);
   console.log(`📍 Puerto: ${PORT}`);
   console.log(`🤖 Modelo Chat: ${CHAT_MODEL}`);
   console.log(`🧮 Modelo Embeddings: ${EMBEDDING_MODEL}`);
   console.log(`🔥 Firebase: ${db ? 'ACTIVO' : 'RAM ONLY'}`);
-  console.log(`✨ Features: Synchronous Storage + Debug Logs`);
+  console.log(`✨ Features: Retry Logic + Rate Limit Handling`);
 });
