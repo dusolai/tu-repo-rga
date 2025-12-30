@@ -277,6 +277,16 @@ app.post('/link-file', async (req, res) => {
             STORES_RAM.set(storeId, store);
         }
         
+        // CRÍTICO: Asegurar que los arrays existen
+        if (!Array.isArray(store.files)) {
+            console.log(`⚠️ Inicializando store.files (era ${typeof store.files})`);
+            store.files = [];
+        }
+        if (!Array.isArray(store.chunks)) {
+            console.log(`⚠️ Inicializando store.chunks (era ${typeof store.chunks})`);
+            store.chunks = [];
+        }
+        
         // Guardar en RAM (SÍNCRONO)
         const fileEntry = { 
             fileName, 
