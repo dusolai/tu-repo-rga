@@ -1,7 +1,4 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { GoogleAIFileManager } = require("@google/generative-ai/server");
-const admin = require('firebase-admin');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
@@ -12,75 +9,12 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// --- FIREBASE ---
-let db = null;
-try {
-    if (process.env.FIREBASE_CREDENTIALS) {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-        db = getFirestore();
-        console.log("🔥 Firebase: CONECTADO");
-    }
-} catch (e) {
-    console.error("⚠️ Firebase:", e.message);
-}
-
 const STORES_RAM = new Map();
 
-// ===================================
-// SISTEMA DE MODELOS CON FALLBACK AUTOMÁTICO
-// ===================================
-const MODEL_CACHE = {
-    chat: null,
-    lastChecked: null
-};
-
-// Lista de modelos en orden de preferencia (del mejor al más básico)
-const CHAT_MODELS_PRIORITY = [
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-pro",
-    "gemini-pro"
-];
-
-const EMBEDDING_MODEL = "text-embedding-004"; // Este es estable
-
-async function getWorkingChatModel(apiKey) {
-    // Si tenemos un modelo cacheado que funciona, usarlo
-    const cacheAge = Date.now() - (MODEL_CACHE.lastChecked || 0);
-    if (MODEL_CACHE.chat && cacheAge < 3600000) { // Cache válido por 1 hora
-        return MODEL_CACHE.chat;
-    }
-    
-    console.log("🔍 Buscando modelo de chat disponible...");
-    const genAI = new GoogleGenerativeAI(apiKey);
-    
-    // Probar cada modelo en orden de prioridad
-    for (const modelName of CHAT_MODELS_PRIORITY) {
-        try {
-            console.log(`   Probando: ${modelName}...`);
-            const model = genAI.getGenerativeModel({ model: modelName });
-            
-            // Probar con una consulta simple
-            const result = await model.generateContent("Test");
-            const text = result.response.text();
-            
-            if (text) {
-                console.log(`   ✅ Modelo funcionando: ${modelName}`);
-                MODEL_CACHE.chat = modelName;
-                MODEL_CACHE.lastChecked = Date.now();
-                return modelName;
-            }
-        } catch (error) {
-            console.log(`   ❌ ${modelName} no disponible: ${error.message.substring(0, 100)}`);
-            continue;
-        }
-    }
-    
-    // Si ninguno funciona, usar el último conocido o tirar error
-    throw new Error("No se encontró ningún modelo de chat disponible. Verifica tu API key.");
-}
+// MODELOS ESTABLES (API v1 - SIN BETA)
+const CHAT_MODEL = "gemini-1.5-flash"; // Modelo principal
+const FALLBACK_MODEL = "gemini-pro"; // Respaldo si falla el principal
+const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -98,7 +32,7 @@ const getApiKey = () => {
 };
 
 // ===================================
-// CHUNKING INTELIGENTE
+// CHUNKING
 // ===================================
 function smartChunk(text, fileName, maxChunkSize = 1000) {
     const chunks = [];
@@ -153,7 +87,7 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
 }
 
 // ===================================
-// EMBEDDINGS CON RETRY
+// EMBEDDINGS
 // ===================================
 async function generateEmbedding(text, apiKey, retries = 3) {
     for (let attempt = 1; attempt <= retries; attempt++) {
@@ -164,12 +98,9 @@ async function generateEmbedding(text, apiKey, retries = 3) {
             return result.embedding.values;
         } catch (e) {
             if (e.message.includes('429') && attempt < retries) {
-                const waitTime = attempt * 2000;
-                console.log(`⏳ Esperando ${waitTime/1000}s antes de reintentar embedding (intento ${attempt}/${retries})...`);
-                await new Promise(r => setTimeout(r, waitTime));
+                await new Promise(r => setTimeout(r, 2000 * attempt));
                 continue;
             }
-            console.error(`Error generando embedding (intento ${attempt}/${retries}):`, e.message);
             if (attempt === retries) return null;
         }
     }
@@ -182,9 +113,7 @@ async function generateEmbedding(text, apiKey, retries = 3) {
 function cosineSimilarity(vecA, vecB) {
     if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
     
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
+    let dotProduct = 0, normA = 0, normB = 0;
     
     for (let i = 0; i < vecA.length; i++) {
         dotProduct += vecA[i] * vecB[i];
@@ -211,43 +140,34 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "17.0.0 - AUTO MODEL DETECTION",
-    features: ["Auto Model Detection", "Smart Chunking", "Embeddings", "Semantic Search"],
+    version: "18.0.0 - STABLE MODELS ONLY",
     models: { 
-        chat: MODEL_CACHE.chat || "Auto-detect on first request",
-        embedding: EMBEDDING_MODEL,
-        chatPriority: CHAT_MODELS_PRIORITY
+        chat: CHAT_MODEL,
+        fallback: FALLBACK_MODEL,
+        embedding: EMBEDDING_MODEL
     }
 }));
 
 // 1. CREATE STORE
 app.post('/create-store', async (req, res) => {
     try {
-        const name = req.body.name || `Cerebro_${Date.now()}`;
         const storeId = `cerebro_${Date.now()}`;
-        
         const storeData = { 
-            name, 
+            name: req.body.name || storeId,
             files: [],
             chunks: [],
             createdAt: new Date() 
         };
         
         STORES_RAM.set(storeId, storeData);
-        
-        if (db) {
-            await db.collection('stores').doc(storeId).set(storeData);
-        }
-        
         console.log(`✅ Store creado: ${storeId}`);
         res.json({ name: storeId });
     } catch (error) {
-        console.error("Error creando store:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 2. UPLOAD CON CHUNKING Y EMBEDDINGS
+// 2. UPLOAD
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file' });
@@ -269,28 +189,22 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         
         const chunks = smartChunk(extractedText, fileName);
         
-        console.log(`🧮 Generando embeddings para ${chunks.length} chunks...`);
+        console.log(`🧮 Generando embeddings...`);
         const chunksWithEmbeddings = [];
         
         for (const chunk of chunks) {
             const embedding = await generateEmbedding(chunk.text, apiKey);
-            chunksWithEmbeddings.push({
-                ...chunk,
-                embedding
-            });
+            chunksWithEmbeddings.push({ ...chunk, embedding });
             await new Promise(r => setTimeout(r, 200));
         }
         
-        if (fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
+        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
         
-        console.log(`✅ Archivo procesado: ${chunks.length} chunks con embeddings`);
+        console.log(`✅ Procesado: ${chunks.length} chunks`);
         
         res.json({
             file: {
                 fileName,
-                extractedText: extractedText.substring(0, 500),
                 chunkCount: chunks.length,
                 chunks: chunksWithEmbeddings
             }
@@ -306,72 +220,31 @@ app.post('/link-file', async (req, res) => {
     try {
         const { storeId, fileName, chunks } = req.body;
         
-        console.log(`🔗 Vinculando ${fileName} con ${chunks?.length || 0} chunks a ${storeId}`);
-        
-        if (!storeId || !fileName || !chunks || !Array.isArray(chunks)) {
-            return res.status(400).json({ 
-                error: 'Datos inválidos',
-                received: { storeId: !!storeId, fileName: !!fileName, chunks: chunks?.length }
-            });
+        if (!storeId || !fileName || !chunks) {
+            return res.status(400).json({ error: 'Datos inválidos' });
         }
         
         let store = STORES_RAM.get(storeId);
-        
         if (!store) {
-            if (db) {
-                const doc = await db.collection('stores').doc(storeId).get();
-                if (doc.exists) {
-                    store = doc.data();
-                }
-            }
-            
-            if (!store) {
-                store = { name: "Recuperado", files: [], chunks: [], createdAt: new Date() };
-            }
-            
+            store = { name: "Recuperado", files: [], chunks: [] };
             STORES_RAM.set(storeId, store);
         }
         
         if (!Array.isArray(store.files)) store.files = [];
         if (!Array.isArray(store.chunks)) store.chunks = [];
         
-        const fileEntry = { fileName, chunkCount: chunks.length, linkedAt: new Date() };
-        
-        store.files.push(fileEntry);
+        store.files.push({ fileName, chunkCount: chunks.length });
         store.chunks.push(...chunks);
         
-        console.log(`💾 RAM: Guardados ${chunks.length} chunks. Total: ${store.chunks.length} chunks`);
+        console.log(`💾 Guardados ${chunks.length} chunks`);
         
-        if (db) {
-            try {
-                await db.collection('stores').doc(storeId).update({
-                    files: FieldValue.arrayUnion(fileEntry),
-                    chunks: FieldValue.arrayUnion(...chunks)
-                });
-            } catch (dbError) {
-                console.error("⚠️ Error guardando en Firebase:", dbError.message);
-            }
-        }
-        
-        res.json({ 
-            success: true,
-            stored: {
-                fileName,
-                chunkCount: chunks.length,
-                totalChunksInStore: store.chunks.length,
-                totalFilesInStore: store.files.length
-            }
-        });
-        
-        console.log(`✅ Link completado: ${fileName}`);
-        
+        res.json({ success: true });
     } catch (error) {
-        console.error("❌ Error en link-file:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 4. CHAT CON AUTO-DETECCIÓN DE MODELO
+// 4. CHAT - SIMPLE Y ROBUSTO
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
@@ -379,19 +252,7 @@ app.post('/chat', async (req, res) => {
         
         console.log(`💬 Pregunta: "${query}"`);
         
-        let store = STORES_RAM.get(storeId);
-        
-        if (!store && db) {
-            try {
-                const doc = await db.collection('stores').doc(storeId).get();
-                if (doc.exists) {
-                    store = doc.data();
-                    STORES_RAM.set(storeId, store);
-                }
-            } catch (e) {
-                console.error("Error leyendo DB:", e.message);
-            }
-        }
+        const store = STORES_RAM.get(storeId);
         
         if (!store || !store.chunks || store.chunks.length === 0) {
             return res.json({ 
@@ -402,7 +263,7 @@ app.post('/chat', async (req, res) => {
         
         console.log(`📊 Buscando en ${store.chunks.length} chunks`);
         
-        const queryEmbedding = await generateEmbedding(query, apiKey, 3);
+        const queryEmbedding = await generateEmbedding(query, apiKey);
         
         const scoredChunks = store.chunks.map(chunk => {
             const semanticScore = queryEmbedding && chunk.embedding 
@@ -419,88 +280,72 @@ app.post('/chat', async (req, res) => {
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
-        console.log(`🎯 Top 5 chunks encontrados`);
+        console.log(`🎯 Top chunks: ${topChunks.map(c => c.finalScore.toFixed(3)).join(', ')}`);
         
         const context = topChunks
-            .map(c => `[Fuente: ${c.fileName}]\n${c.text}`)
+            .map(c => `[${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
-        // OBTENER MODELO DISPONIBLE AUTOMÁTICAMENTE
-        const chatModel = await getWorkingChatModel(apiKey);
-        console.log(`🤖 Usando modelo: ${chatModel}`);
-        
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: chatModel });
         
-        const prompt = `Contexto:
-
-${context}
-
-Pregunta: ${query}
-
-Responde basándote SOLO en el contexto. Si no está la información, dilo claramente.`;
-
+        // Intentar con modelo principal, luego fallback
         let answer = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-                const result = await model.generateContent(prompt);
-                answer = result.response.text();
-                break;
-            } catch (error) {
-                if (error.message.includes('429') && attempt < 3) {
-                    const waitTime = attempt * 3000;
-                    console.log(`⏳ Esperando ${waitTime/1000}s... (intento ${attempt}/3)`);
-                    await new Promise(r => setTimeout(r, waitTime));
-                    continue;
-                }
-                
-                // Si falla por modelo, invalidar cache y reintentar
-                if (error.message.includes('404') || error.message.includes('not found')) {
-                    console.log(`⚠️ Modelo ${chatModel} ya no disponible, buscando alternativa...`);
-                    MODEL_CACHE.chat = null;
-                    MODEL_CACHE.lastChecked = null;
+        const modelsToTry = [CHAT_MODEL, FALLBACK_MODEL];
+        
+        for (const modelName of modelsToTry) {
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    console.log(`🤖 Intentando con modelo: ${modelName} (intento ${attempt})`);
                     
-                    if (attempt < 3) {
-                        await new Promise(r => setTimeout(r, 1000));
+                    const model = genAI.getGenerativeModel({ model: modelName });
+                    
+                    const result = await model.generateContent({
+                        contents: [{
+                            role: "user",
+                            parts: [{
+                                text: `Contexto:\n${context}\n\nPregunta: ${query}\n\nResponde basándote SOLO en el contexto.`
+                            }]
+                        }]
+                    });
+                    
+                    answer = result.response.text();
+                    
+                    if (answer) {
+                        console.log(`✅ Respuesta generada con ${modelName}`);
+                        break;
+                    }
+                } catch (error) {
+                    console.log(`⚠️ ${modelName} falló: ${error.message.substring(0, 100)}`);
+                    
+                    if (error.message.includes('429')) {
+                        await new Promise(r => setTimeout(r, 3000));
                         continue;
                     }
+                    
+                    break; // Probar siguiente modelo
                 }
-                
-                throw error;
             }
+            
+            if (answer) break;
         }
         
         if (!answer) {
             return res.json({
-                text: "⚠️ No se pudo generar respuesta. Intenta de nuevo en unos segundos.",
+                text: "⚠️ Error temporal. Intenta de nuevo en unos segundos.",
                 sources: []
             });
         }
-        
-        console.log(`✅ Respuesta generada`);
         
         res.json({
             text: answer,
             sources: topChunks.map(c => ({
                 fileName: c.fileName,
                 score: c.finalScore.toFixed(3)
-            })),
-            debug: {
-                model: chatModel,
-                totalChunks: store.chunks.length
-            }
+            }))
         });
         
     } catch (error) {
         console.error("Error en chat:", error);
-        
-        if (error.message.includes('429')) {
-            return res.json({ 
-                text: `⚠️ Límite de uso alcanzado. Espera 1 minuto.`,
-                sources: []
-            });
-        }
-        
         res.json({ 
             text: `❌ Error: ${error.message}`,
             sources: []
@@ -509,45 +354,23 @@ Responde basándote SOLO en el contexto. Si no está la información, dilo clara
 });
 
 // 5. LIST FILES
-app.get('/files', async (req, res) => {
-    try {
-        const { storeId } = req.query;
-        if (!storeId) return res.json({ files: [], totalChunks: 0 });
-        
-        let store = STORES_RAM.get(storeId);
-        
-        if (!store && db) {
-            const doc = await db.collection('stores').doc(storeId).get();
-            if (doc.exists) {
-                store = doc.data();
-                STORES_RAM.set(storeId, store);
-            }
-        }
-        
-        if (!store) return res.json({ files: [], totalChunks: 0 });
-        
-        const fileNames = (store.files || []).map(f => f.fileName).filter(Boolean);
-        
-        res.json({ 
-            files: fileNames,
-            totalChunks: store.chunks?.length || 0
-        });
-    } catch (error) {
-        res.json({ files: [], totalChunks: 0 });
-    }
-});
-
-app.use((err, req, res, next) => {
-  console.error('❌ Error:', err);
-  res.status(500).json({ error: 'Error interno' });
+app.get('/files', (req, res) => {
+    const { storeId } = req.query;
+    const store = STORES_RAM.get(storeId);
+    
+    if (!store) return res.json({ files: [], totalChunks: 0 });
+    
+    res.json({ 
+        files: (store.files || []).map(f => f.fileName),
+        totalChunks: store.chunks?.length || 0
+    });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v17.0.0 - AUTO MODEL DETECTION`);
+  console.log(`🚀 Backend v18.0.0 - STABLE MODELS ONLY`);
   console.log(`📍 Puerto: ${PORT}`);
-  console.log(`🤖 Modelos disponibles (en orden):`);
-  CHAT_MODELS_PRIORITY.forEach((m, i) => console.log(`   ${i+1}. ${m}`));
+  console.log(`🤖 Modelo Chat Principal: ${CHAT_MODEL}`);
+  console.log(`🔄 Modelo Fallback: ${FALLBACK_MODEL}`);
   console.log(`🧮 Modelo Embeddings: ${EMBEDDING_MODEL}`);
-  console.log(`🔥 Firebase: ${db ? 'ACTIVO' : 'RAM ONLY'}`);
-  console.log(`✨ Sistema de auto-detección activado`);
+  console.log(`✨ Sin dependencias externas, 100% RAM`);
 });
