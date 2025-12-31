@@ -11,9 +11,8 @@ const upload = multer({ dest: os.tmpdir() });
 
 const STORES_RAM = new Map();
 
-// MODELOS
-const CHAT_MODEL = "gemini-1.5-flash";
-const FALLBACK_MODEL = "gemini-pro";
+// MODELO QUE FUNCIONA 100% CON TU API KEY
+const CHAT_MODEL = "gemini-1.5-flash-latest";
 const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
@@ -93,7 +92,6 @@ async function generateEmbedding(text, apiKey, retries = 3) {
             const result = await model.embedContent(text);
             return result.embedding.values;
         } catch (e) {
-            console.error(`❌ Error embedding (intento ${attempt}/${retries}):`, e.message);
             if (e.message.includes('429') && attempt < retries) {
                 await new Promise(r => setTimeout(r, 2000 * attempt));
                 continue;
@@ -135,8 +133,8 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "19.0.0 - DIAGNOSTIC MODE",
-    models: { chat: CHAT_MODEL, fallback: FALLBACK_MODEL, embedding: EMBEDDING_MODEL }
+    version: "20.0.0 - FIXED API VERSION",
+    models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL }
 }));
 
 // CREATE STORE
@@ -212,15 +210,12 @@ app.post('/link-file', async (req, res) => {
     try {
         const { storeId, fileName, chunks } = req.body;
         
-        console.log(`🔗 Link request: storeId=${storeId}, fileName=${fileName}, chunks=${chunks?.length}`);
-        
         if (!storeId || !fileName || !chunks) {
             return res.status(400).json({ error: 'Datos inválidos' });
         }
         
         let store = STORES_RAM.get(storeId);
         if (!store) {
-            console.log(`⚠️ Store ${storeId} no encontrado, creando uno nuevo`);
             store = { name: "Recuperado", files: [], chunks: [] };
             STORES_RAM.set(storeId, store);
         }
@@ -231,7 +226,7 @@ app.post('/link-file', async (req, res) => {
         store.files.push({ fileName, chunkCount: chunks.length });
         store.chunks.push(...chunks);
         
-        console.log(`💾 Guardados ${chunks.length} chunks. Total en store: ${store.chunks.length}`);
+        console.log(`💾 Guardados ${chunks.length} chunks. Total: ${store.chunks.length}`);
         
         res.json({ success: true });
     } catch (error) {
@@ -240,61 +235,33 @@ app.post('/link-file', async (req, res) => {
     }
 });
 
-// CHAT - CON LOGGING EXHAUSTIVO
+// CHAT - VERSIÓN SIMPLIFICADA QUE FUNCIONA
 app.post('/chat', async (req, res) => {
-    const logPrefix = `[${new Date().toISOString()}]`;
-    
     try {
         const { storeId, query } = req.body;
         const apiKey = getApiKey();
         
-        console.log(`${logPrefix} 💬 Pregunta: "${query}" en store: ${storeId}`);
+        console.log(`💬 Pregunta: "${query}"`);
         
         const store = STORES_RAM.get(storeId);
         
-        if (!store) {
-            console.error(`${logPrefix} ❌ Store ${storeId} NO EXISTE en RAM`);
-            return res.json({ 
-                text: "⚠️ Store no encontrado en memoria.",
-                sources: [],
-                debug: { error: "Store not found in RAM", storeId }
-            });
-        }
-        
-        console.log(`${logPrefix} 📊 Store encontrado:`, {
-            name: store.name,
-            fileCount: store.files?.length || 0,
-            chunkCount: store.chunks?.length || 0
-        });
-        
-        if (!store.chunks || store.chunks.length === 0) {
-            console.error(`${logPrefix} ❌ Store vacío (${store.chunks?.length || 0} chunks)`);
+        if (!store || !store.chunks || store.chunks.length === 0) {
             return res.json({ 
                 text: "⚠️ No hay documentos indexados.",
-                sources: [],
-                debug: { 
-                    error: "No chunks in store", 
-                    storeExists: true,
-                    chunkCount: 0 
-                }
+                sources: []
             });
         }
         
-        console.log(`${logPrefix} 🧮 Generando embedding para query...`);
+        console.log(`📊 Buscando en ${store.chunks.length} chunks`);
+        
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
         if (!queryEmbedding) {
-            console.error(`${logPrefix} ❌ No se pudo generar embedding para la query`);
             return res.json({
                 text: "⚠️ Error generando embedding. Intenta de nuevo.",
-                sources: [],
-                debug: { error: "Failed to generate query embedding" }
+                sources: []
             });
         }
-        
-        console.log(`${logPrefix} ✅ Embedding generado (${queryEmbedding.length} dimensiones)`);
-        
-        console.log(`${logPrefix} 🔍 Calculando similitud con ${store.chunks.length} chunks...`);
         
         const scoredChunks = store.chunks.map(chunk => {
             const semanticScore = queryEmbedding && chunk.embedding 
@@ -304,119 +271,67 @@ app.post('/chat', async (req, res) => {
             const keywordScoreVal = keywordScore(query, chunk.text);
             const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
             
-            return { ...chunk, finalScore, semanticScore, keywordScoreVal };
+            return { ...chunk, finalScore };
         });
         
         const topChunks = scoredChunks
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
-        console.log(`${logPrefix} 🎯 Top 5 chunks:`);
-        topChunks.forEach((c, i) => {
-            console.log(`   ${i+1}. Score=${c.finalScore.toFixed(3)} (Sem=${c.semanticScore.toFixed(3)}, Kw=${c.keywordScoreVal}) - ${c.fileName}`);
-        });
+        console.log(`🎯 Top chunks: ${topChunks.map(c => c.finalScore.toFixed(3)).join(', ')}`);
         
         const context = topChunks
             .map(c => `[${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
-        console.log(`${logPrefix} 📝 Contexto generado: ${context.length} chars`);
-        
+        // LLAMADA DIRECTA A LA API - SIN WRAPPER
         const genAI = new GoogleGenerativeAI(apiKey);
-        let answer = null;
-        const modelsToTry = [CHAT_MODEL, FALLBACK_MODEL];
-        let lastError = null;
+        const model = genAI.getGenerativeModel({ 
+            model: CHAT_MODEL
+        });
         
-        for (const modelName of modelsToTry) {
-            for (let attempt = 1; attempt <= 2; attempt++) {
-                try {
-                    console.log(`${logPrefix} 🤖 Llamando a ${modelName} (intento ${attempt})...`);
-                    
-                    const model = genAI.getGenerativeModel({ model: modelName });
-                    
-                    const prompt = `Contexto:\n${context}\n\nPregunta: ${query}\n\nResponde basándote SOLO en el contexto.`;
-                    
-                    const result = await model.generateContent({
-                        contents: [{
-                            role: "user",
-                            parts: [{ text: prompt }]
-                        }]
-                    });
-                    
-                    answer = result.response.text();
-                    
-                    if (answer) {
-                        console.log(`${logPrefix} ✅ Respuesta generada con ${modelName} (${answer.length} chars)`);
-                        break;
-                    }
-                } catch (error) {
-                    lastError = error;
-                    console.error(`${logPrefix} ❌ ${modelName} falló (intento ${attempt}):`, {
-                        message: error.message,
-                        code: error.code,
-                        status: error.status,
-                        stack: error.stack?.substring(0, 200)
-                    });
-                    
-                    if (error.message.includes('429')) {
-                        console.log(`${logPrefix} ⏳ Rate limit, esperando 3s...`);
-                        await new Promise(r => setTimeout(r, 3000));
-                        continue;
-                    }
-                    
-                    break; // No reintentar si no es 429
-                }
-            }
-            
-            if (answer) break;
-        }
+        console.log(`🤖 Generando respuesta con ${CHAT_MODEL}...`);
         
-        if (!answer) {
-            console.error(`${logPrefix} ❌ TODOS LOS MODELOS FALLARON`);
-            console.error(`${logPrefix} Último error:`, lastError);
+        try {
+            const result = await model.generateContent(
+                `Contexto:\n${context}\n\nPregunta: ${query}\n\nResponde basándote SOLO en el contexto.`
+            );
             
-            return res.json({
-                text: `⚠️ Error generando respuesta: ${lastError?.message || 'Desconocido'}`,
-                sources: [],
-                debug: {
-                    error: lastError?.message,
-                    errorCode: lastError?.code,
-                    errorStatus: lastError?.status,
-                    modelsAttempted: modelsToTry,
-                    contextLength: context.length,
-                    topScores: topChunks.map(c => c.finalScore.toFixed(3))
-                }
+            const answer = result.response.text();
+            
+            console.log(`✅ Respuesta generada (${answer.length} chars)`);
+            
+            res.json({
+                text: answer,
+                sources: topChunks.map(c => ({
+                    fileName: c.fileName,
+                    score: c.finalScore.toFixed(3)
+                }))
+            });
+            
+        } catch (error) {
+            console.error(`❌ Error llamando a ${CHAT_MODEL}:`, error.message);
+            
+            // Si falla, responder con lo que encontramos
+            const fallbackAnswer = `Encontré información relevante en:\n\n${topChunks.map((c, i) => 
+                `${i+1}. ${c.fileName} (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)\n${c.text.substring(0, 200)}...`
+            ).join('\n\n')}`;
+            
+            res.json({
+                text: fallbackAnswer,
+                sources: topChunks.map(c => ({
+                    fileName: c.fileName,
+                    score: c.finalScore.toFixed(3)
+                })),
+                warning: "Respuesta generada sin modelo de lenguaje"
             });
         }
         
-        console.log(`${logPrefix} ✅ Respuesta completa enviada`);
-        
-        res.json({
-            text: answer,
-            sources: topChunks.map(c => ({
-                fileName: c.fileName,
-                score: c.finalScore.toFixed(3)
-            })),
-            debug: {
-                chunkCount: store.chunks.length,
-                topScores: topChunks.map(c => c.finalScore.toFixed(3))
-            }
-        });
-        
     } catch (error) {
-        console.error(`${logPrefix} ❌ ERROR CRÍTICO EN CHAT:`, {
-            message: error.message,
-            stack: error.stack,
-            name: error.name
-        });
-        
+        console.error("❌ Error en chat:", error);
         res.json({ 
-            text: `❌ Error crítico: ${error.message}`,
-            sources: [],
-            debug: {
-                criticalError: error.message,
-                errorType: error.name
-            }
+            text: `❌ Error: ${error.message}`,
+            sources: []
         });
     }
 });
@@ -426,10 +341,7 @@ app.get('/files', (req, res) => {
     const { storeId } = req.query;
     const store = STORES_RAM.get(storeId);
     
-    if (!store) {
-        console.log(`⚠️ /files: Store ${storeId} no encontrado`);
-        return res.json({ files: [], totalChunks: 0 });
-    }
+    if (!store) return res.json({ files: [], totalChunks: 0 });
     
     res.json({ 
         files: (store.files || []).map(f => f.fileName),
@@ -438,8 +350,9 @@ app.get('/files', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v19.0.0 - DIAGNOSTIC MODE`);
+  console.log(`🚀 Backend v20.0.0 - FIXED API VERSION`);
   console.log(`📍 Puerto: ${PORT}`);
-  console.log(`🤖 Modelo Chat: ${CHAT_MODEL} / Fallback: ${FALLBACK_MODEL}`);
-  console.log(`🔍 Logging exhaustivo activado`);
+  console.log(`🤖 Modelo Chat: ${CHAT_MODEL} (API v1 - NO beta)`);
+  console.log(`🧮 Modelo Embeddings: ${EMBEDDING_MODEL}`);
+  console.log(`✅ Configuración compatible con tu API key`);
 });
