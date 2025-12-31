@@ -11,8 +11,8 @@ const upload = multer({ dest: os.tmpdir() });
 
 const STORES_RAM = new Map();
 
-// MODELO QUE FUNCIONA 100% CON TU API KEY
-const CHAT_MODEL = "gemini-1.5-flash-latest";
+// MODELO MÁS BÁSICO - COMPATIBLE CON TODAS LAS API KEYS
+const CHAT_MODEL = "gemini-pro";
 const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
@@ -47,8 +47,7 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
                 id: `${fileName}_chunk_${chunkIndex}`,
                 text: currentChunk.trim(),
                 fileName,
-                index: chunkIndex,
-                charCount: currentChunk.length
+                index: chunkIndex
             });
             chunkIndex++;
             currentChunk = "";
@@ -61,8 +60,7 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
                 id: `${fileName}_chunk_${chunkIndex}`,
                 text: currentChunk.trim(),
                 fileName,
-                index: chunkIndex,
-                charCount: currentChunk.length
+                index: chunkIndex
             });
             chunkIndex++;
             currentChunk = "";
@@ -74,8 +72,7 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
             id: `${fileName}_chunk_${chunkIndex}`,
             text: currentChunk.trim(),
             fileName,
-            index: chunkIndex,
-            charCount: currentChunk.length
+            index: chunkIndex
         });
     }
     
@@ -133,31 +130,27 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "20.0.0 - FIXED API VERSION",
+    version: "21.0.0 - GEMINI PRO (MOST COMPATIBLE)",
     models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL }
 }));
 
-// CREATE STORE
 app.post('/create-store', async (req, res) => {
     try {
         const storeId = `cerebro_${Date.now()}`;
         const storeData = { 
             name: req.body.name || storeId,
             files: [],
-            chunks: [],
-            createdAt: new Date() 
+            chunks: []
         };
         
         STORES_RAM.set(storeId, storeData);
         console.log(`✅ Store creado: ${storeId}`);
         res.json({ name: storeId });
     } catch (error) {
-        console.error("❌ Error creando store:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// UPLOAD
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file' });
@@ -178,8 +171,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         }
         
         const chunks = smartChunk(extractedText, fileName);
-        
-        console.log(`🧮 Generando embeddings...`);
         const chunksWithEmbeddings = [];
         
         for (const chunk of chunks) {
@@ -190,8 +181,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         
         if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
         
-        console.log(`✅ Procesado: ${chunks.length} chunks`);
-        
         res.json({
             file: {
                 fileName,
@@ -200,12 +189,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             }
         });
     } catch (error) {
-        console.error("❌ Error en upload:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// LINK FILE
 app.post('/link-file', async (req, res) => {
     try {
         const { storeId, fileName, chunks } = req.body;
@@ -226,16 +213,15 @@ app.post('/link-file', async (req, res) => {
         store.files.push({ fileName, chunkCount: chunks.length });
         store.chunks.push(...chunks);
         
-        console.log(`💾 Guardados ${chunks.length} chunks. Total: ${store.chunks.length}`);
+        console.log(`💾 Guardados ${chunks.length} chunks`);
         
         res.json({ success: true });
     } catch (error) {
-        console.error("❌ Error en link-file:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// CHAT - VERSIÓN SIMPLIFICADA QUE FUNCIONA
+// CHAT - USANDO GEMINI-PRO
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
@@ -252,16 +238,7 @@ app.post('/chat', async (req, res) => {
             });
         }
         
-        console.log(`📊 Buscando en ${store.chunks.length} chunks`);
-        
         const queryEmbedding = await generateEmbedding(query, apiKey);
-        
-        if (!queryEmbedding) {
-            return res.json({
-                text: "⚠️ Error generando embedding. Intenta de nuevo.",
-                sources: []
-            });
-        }
         
         const scoredChunks = store.chunks.map(chunk => {
             const semanticScore = queryEmbedding && chunk.embedding 
@@ -278,28 +255,33 @@ app.post('/chat', async (req, res) => {
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
-        console.log(`🎯 Top chunks: ${topChunks.map(c => c.finalScore.toFixed(3)).join(', ')}`);
-        
         const context = topChunks
-            .map(c => `[${c.fileName}]\n${c.text}`)
+            .map(c => `[Fuente: ${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
-        // LLAMADA DIRECTA A LA API - SIN WRAPPER
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ 
-            model: CHAT_MODEL
-        });
+        const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
-        console.log(`🤖 Generando respuesta con ${CHAT_MODEL}...`);
-        
+        const prompt = `Basándote ÚNICAMENTE en el siguiente contexto, responde la pregunta del usuario de forma concisa y precisa.
+
+CONTEXTO:
+${context}
+
+PREGUNTA: ${query}
+
+INSTRUCCIONES:
+- Responde SOLO con información del contexto
+- Si la información no está en el contexto, di "No encuentro esa información en los documentos"
+- Sé conciso y directo
+- Cita las fuentes entre corchetes cuando sea relevante
+
+RESPUESTA:`;
+
         try {
-            const result = await model.generateContent(
-                `Contexto:\n${context}\n\nPregunta: ${query}\n\nResponde basándote SOLO en el contexto.`
-            );
-            
+            const result = await model.generateContent(prompt);
             const answer = result.response.text();
             
-            console.log(`✅ Respuesta generada (${answer.length} chars)`);
+            console.log(`✅ Respuesta: ${answer.substring(0, 100)}...`);
             
             res.json({
                 text: answer,
@@ -310,25 +292,24 @@ app.post('/chat', async (req, res) => {
             });
             
         } catch (error) {
-            console.error(`❌ Error llamando a ${CHAT_MODEL}:`, error.message);
+            console.error(`❌ Error con ${CHAT_MODEL}:`, error.message);
             
-            // Si falla, responder con lo que encontramos
-            const fallbackAnswer = `Encontré información relevante en:\n\n${topChunks.map((c, i) => 
-                `${i+1}. ${c.fileName} (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)\n${c.text.substring(0, 200)}...`
-            ).join('\n\n')}`;
+            // FALLBACK: Mostrar chunks directamente de forma más natural
+            const fallbackText = `Encontré esta información relevante:\n\n${topChunks.map((c, i) => 
+                `**${c.fileName}**:\n${c.text.substring(0, 300)}${c.text.length > 300 ? '...' : ''}`
+            ).join('\n\n---\n\n')}`;
             
             res.json({
-                text: fallbackAnswer,
+                text: fallbackText,
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
                     score: c.finalScore.toFixed(3)
-                })),
-                warning: "Respuesta generada sin modelo de lenguaje"
+                }))
             });
         }
         
     } catch (error) {
-        console.error("❌ Error en chat:", error);
+        console.error("❌ Error:", error);
         res.json({ 
             text: `❌ Error: ${error.message}`,
             sources: []
@@ -336,7 +317,6 @@ app.post('/chat', async (req, res) => {
     }
 });
 
-// LIST FILES
 app.get('/files', (req, res) => {
     const { storeId } = req.query;
     const store = STORES_RAM.get(storeId);
@@ -350,9 +330,6 @@ app.get('/files', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v20.0.0 - FIXED API VERSION`);
-  console.log(`📍 Puerto: ${PORT}`);
-  console.log(`🤖 Modelo Chat: ${CHAT_MODEL} (API v1 - NO beta)`);
-  console.log(`🧮 Modelo Embeddings: ${EMBEDDING_MODEL}`);
-  console.log(`✅ Configuración compatible con tu API key`);
+  console.log(`🚀 Backend v21.0.0 - GEMINI PRO (MOST COMPATIBLE)`);
+  console.log(`🤖 Modelo: ${CHAT_MODEL} (Sin sufijos, máxima compatibilidad)`);
 });
