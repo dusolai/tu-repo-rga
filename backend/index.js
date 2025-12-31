@@ -11,8 +11,8 @@ const upload = multer({ dest: os.tmpdir() });
 
 const STORES_RAM = new Map();
 
-// MODELO MÁS BÁSICO - COMPATIBLE CON TODAS LAS API KEYS
-const CHAT_MODEL = "gemini-pro";
+// MODELO CON LÍMITES ALTOS Y CUOTA DISPONIBLE
+const CHAT_MODEL = "gemini-2.5-flash";  // 1M TPM, 10K RPD ✅
 const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
@@ -30,7 +30,6 @@ const getApiKey = () => {
   return key;
 };
 
-// CHUNKING
 function smartChunk(text, fileName, maxChunkSize = 1000) {
     const chunks = [];
     text = text.replace(/\s+/g, ' ').trim();
@@ -80,7 +79,6 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
     return chunks;
 }
 
-// EMBEDDINGS
 async function generateEmbedding(text, apiKey, retries = 3) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
@@ -99,7 +97,6 @@ async function generateEmbedding(text, apiKey, retries = 3) {
     return null;
 }
 
-// BÚSQUEDA
 function cosineSimilarity(vecA, vecB) {
     if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
     
@@ -130,8 +127,9 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "21.0.0 - GEMINI PRO (MOST COMPATIBLE)",
-    models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL }
+    version: "22.0.0 - GEMINI 2.5 FLASH",
+    models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL },
+    limits: { tpm: "1M", rpd: "10K", rpm: "1K" }
 }));
 
 app.post('/create-store', async (req, res) => {
@@ -221,7 +219,6 @@ app.post('/link-file', async (req, res) => {
     }
 });
 
-// CHAT - USANDO GEMINI-PRO
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
@@ -255,14 +252,16 @@ app.post('/chat', async (req, res) => {
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
+        console.log(`🎯 Top 5 chunks: ${topChunks.map(c => c.finalScore.toFixed(3)).join(', ')}`);
+        
         const context = topChunks
-            .map(c => `[Fuente: ${c.fileName}]\n${c.text}`)
+            .map(c => `[${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
-        const prompt = `Basándote ÚNICAMENTE en el siguiente contexto, responde la pregunta del usuario de forma concisa y precisa.
+        const prompt = `Eres un asistente que responde preguntas basándose ÚNICAMENTE en el contexto proporcionado.
 
 CONTEXTO:
 ${context}
@@ -270,18 +269,20 @@ ${context}
 PREGUNTA: ${query}
 
 INSTRUCCIONES:
-- Responde SOLO con información del contexto
-- Si la información no está en el contexto, di "No encuentro esa información en los documentos"
-- Sé conciso y directo
-- Cita las fuentes entre corchetes cuando sea relevante
+- Responde SOLO con información que aparezca explícitamente en el contexto
+- Si la respuesta no está en el contexto, di: "No encuentro esa información en los documentos"
+- Sé preciso y conciso
+- Menciona las fuentes relevantes
 
 RESPUESTA:`;
 
         try {
+            console.log(`🤖 Llamando a ${CHAT_MODEL}...`);
+            
             const result = await model.generateContent(prompt);
             const answer = result.response.text();
             
-            console.log(`✅ Respuesta: ${answer.substring(0, 100)}...`);
+            console.log(`✅ Respuesta generada: ${answer.substring(0, 100)}...`);
             
             res.json({
                 text: answer,
@@ -294,13 +295,10 @@ RESPUESTA:`;
         } catch (error) {
             console.error(`❌ Error con ${CHAT_MODEL}:`, error.message);
             
-            // FALLBACK: Mostrar chunks directamente de forma más natural
-            const fallbackText = `Encontré esta información relevante:\n\n${topChunks.map((c, i) => 
-                `**${c.fileName}**:\n${c.text.substring(0, 300)}${c.text.length > 300 ? '...' : ''}`
-            ).join('\n\n---\n\n')}`;
-            
             res.json({
-                text: fallbackText,
+                text: `⚠️ Error del modelo: ${error.message}\n\nPero encontré estos documentos relevantes:\n\n${topChunks.map((c, i) => 
+                    `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)`
+                ).join('\n')}`,
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
                     score: c.finalScore.toFixed(3)
@@ -330,6 +328,8 @@ app.get('/files', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v21.0.0 - GEMINI PRO (MOST COMPATIBLE)`);
-  console.log(`🤖 Modelo: ${CHAT_MODEL} (Sin sufijos, máxima compatibilidad)`);
+  console.log(`🚀 Backend v22.0.0 - GEMINI 2.5 FLASH`);
+  console.log(`🤖 Modelo: ${CHAT_MODEL}`);
+  console.log(`📊 Límites: 1M TPM, 10K RPD, 1K RPM`);
+  console.log(`✅ Cuota disponible según dashboard`);
 });
