@@ -4,15 +4,26 @@ const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
 const pdf = require('pdf-parse');
+const admin = require('firebase-admin');
+
+// ===== INICIALIZAR FIREBASE =====
+try {
+    admin.initializeApp();
+    console.log('✅ Firebase Admin inicializado');
+} catch (error) {
+    if (error.code !== 'app/duplicate-app') {
+        console.error('❌ Error inicializando Firebase:', error.message);
+    }
+}
+
+const db = admin.firestore();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-const STORES_RAM = new Map();
-
 // MODELO CON LÍMITES ALTOS Y CUOTA DISPONIBLE
-const CHAT_MODEL = "gemini-2.5-flash";  // 1M TPM, 10K RPD ✅
+const CHAT_MODEL = "gemini-2.5-flash";
 const EMBEDDING_MODEL = "text-embedding-004";
 
 app.use(express.json({ limit: '50mb' }));
@@ -127,24 +138,26 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "22.0.0 - GEMINI 2.5 FLASH",
+    version: "23.0.0 - FIRESTORE PERSISTENCE",
     models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL },
-    limits: { tpm: "1M", rpd: "10K", rpm: "1K" }
+    database: "Firestore ✅"
 }));
 
 app.post('/create-store', async (req, res) => {
     try {
         const storeId = `cerebro_${Date.now()}`;
-        const storeData = { 
-            name: req.body.name || storeId,
-            files: [],
-            chunks: []
-        };
         
-        STORES_RAM.set(storeId, storeData);
-        console.log(`✅ Store creado: ${storeId}`);
+        // Guardar en Firestore
+        await db.collection('stores').doc(storeId).set({
+            name: req.body.name || storeId,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            files: []
+        });
+        
+        console.log(`✅ Store creado en Firestore: ${storeId}`);
         res.json({ name: storeId });
     } catch (error) {
+        console.error('❌ Error creando store:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -187,6 +200,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             }
         });
     } catch (error) {
+        console.error('❌ Error en upload:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -199,22 +213,41 @@ app.post('/link-file', async (req, res) => {
             return res.status(400).json({ error: 'Datos inválidos' });
         }
         
-        let store = STORES_RAM.get(storeId);
-        if (!store) {
-            store = { name: "Recuperado", files: [], chunks: [] };
-            STORES_RAM.set(storeId, store);
-        }
+        console.log(`💾 Guardando ${chunks.length} chunks en Firestore para ${storeId}`);
         
-        if (!Array.isArray(store.files)) store.files = [];
-        if (!Array.isArray(store.chunks)) store.chunks = [];
+        // Referencia al documento del store
+        const storeRef = db.collection('stores').doc(storeId);
         
-        store.files.push({ fileName, chunkCount: chunks.length });
-        store.chunks.push(...chunks);
+        // Actualizar información del archivo
+        await storeRef.update({
+            files: admin.firestore.FieldValue.arrayUnion({
+                displayName: fileName,
+                chunkCount: chunks.length,
+                uploadedAt: admin.firestore.FieldValue.serverTimestamp()
+            })
+        });
         
-        console.log(`💾 Guardados ${chunks.length} chunks`);
+        // Guardar chunks en subcolección
+        const batch = db.batch();
+        
+        chunks.forEach((chunk, index) => {
+            const chunkRef = storeRef.collection('chunks').doc(`${fileName}_${index}`);
+            batch.set(chunkRef, {
+                text: chunk.text,
+                fileName: chunk.fileName,
+                index: chunk.index || index,
+                embedding: chunk.embedding,
+                createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        });
+        
+        await batch.commit();
+        
+        console.log(`✅ ${chunks.length} chunks guardados en Firestore`);
         
         res.json({ success: true });
     } catch (error) {
+        console.error('❌ Error en link-file:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -224,20 +257,32 @@ app.post('/chat', async (req, res) => {
         const { storeId, query } = req.body;
         const apiKey = getApiKey();
         
-        console.log(`💬 Pregunta: "${query}"`);
+        console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
         
-        const store = STORES_RAM.get(storeId);
+        // Leer chunks desde Firestore
+        const chunksSnapshot = await db.collection('stores')
+            .doc(storeId)
+            .collection('chunks')
+            .get();
         
-        if (!store || !store.chunks || store.chunks.length === 0) {
+        if (chunksSnapshot.empty) {
+            console.log(`⚠️ No hay chunks en ${storeId}`);
             return res.json({ 
-                text: "⚠️ No hay documentos indexados.",
+                text: "⚠️ No hay documentos indexados en este cerebro.",
                 sources: []
             });
         }
         
+        const chunks = [];
+        chunksSnapshot.forEach(doc => {
+            chunks.push(doc.data());
+        });
+        
+        console.log(`📚 Recuperados ${chunks.length} chunks de Firestore`);
+        
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
-        const scoredChunks = store.chunks.map(chunk => {
+        const scoredChunks = chunks.map(chunk => {
             const semanticScore = queryEmbedding && chunk.embedding 
                 ? cosineSimilarity(queryEmbedding, chunk.embedding)
                 : 0;
@@ -307,7 +352,7 @@ RESPUESTA:`;
         }
         
     } catch (error) {
-        console.error("❌ Error:", error);
+        console.error("❌ Error en chat:", error);
         res.json({ 
             text: `❌ Error: ${error.message}`,
             sources: []
@@ -315,21 +360,37 @@ RESPUESTA:`;
     }
 });
 
-app.get('/files', (req, res) => {
-    const { storeId } = req.query;
-    const store = STORES_RAM.get(storeId);
-    
-    if (!store) return res.json({ files: [], totalChunks: 0 });
-    
-    res.json({ 
-        files: (store.files || []).map(f => f.fileName),
-        totalChunks: store.chunks?.length || 0
-    });
+app.get('/files', async (req, res) => {
+    try {
+        const { storeId } = req.query;
+        
+        const storeDoc = await db.collection('stores').doc(storeId).get();
+        
+        if (!storeDoc.exists) {
+            return res.json({ files: [], totalChunks: 0 });
+        }
+        
+        const storeData = storeDoc.data();
+        const files = storeData.files || [];
+        
+        const chunksSnapshot = await db.collection('stores')
+            .doc(storeId)
+            .collection('chunks')
+            .get();
+        
+        res.json({ 
+            files: files.map(f => f.displayName),
+            totalChunks: chunksSnapshot.size
+        });
+    } catch (error) {
+        console.error('❌ Error listando archivos:', error);
+        res.json({ files: [], totalChunks: 0 });
+    }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v22.0.0 - GEMINI 2.5 FLASH`);
+  console.log(`🚀 Backend v23.0.0 - FIRESTORE PERSISTENCE`);
   console.log(`🤖 Modelo: ${CHAT_MODEL}`);
-  console.log(`📊 Límites: 1M TPM, 10K RPD, 1K RPM`);
-  console.log(`✅ Cuota disponible según dashboard`);
+  console.log(`💾 Base de datos: Firestore`);
+  console.log(`✅ Puerto: ${PORT}`);
 });
