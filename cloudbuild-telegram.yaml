@@ -1,0 +1,33 @@
+steps:
+  # Paso 1: Build
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
+      - '-f'
+      - 'telegram-bot/Dockerfile'
+      - 'telegram-bot'
+  
+  # Paso 2: Push
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
+  
+  # Paso 3: Deploy a Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'telegram-voice-bot'
+      - '--image=gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
+      - '--region=europe-southwest1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--min-instances=1'
+      - '--set-env-vars=TELEGRAM_TOKEN=8405388144:AAFU-FLNKBIWC9sX2pPo3za6sVjGVaVrpZI,BACKEND_URL=https://backend-cerebro-987192214624.europe-southwest1.run.app,GEMINI_API_KEY=AIzaSyDlpnw0gNUQNdbqBARbh1XTuxz9hJJw7JM'
+
+images:
+  - 'gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
