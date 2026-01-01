@@ -31,3 +31,7 @@ steps:
 
 images:
   - 'gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
+
+# CONFIGURACIÓN DE LOGS (esto es lo que faltaba)
+options:
+  logging: CLOUD_LOGGING_ONLY
