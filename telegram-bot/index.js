@@ -1,7 +1,6 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -14,7 +13,8 @@ app.get('/', (req, res) => {
     res.json({ 
         status: 'Bot activo 🟢',
         uptime: process.uptime(),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        cerebro: SHARED_CEREBRO_ID
     });
 });
 
@@ -36,10 +36,13 @@ if (!TELEGRAM_TOKEN || !GEMINI_API_KEY) {
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const userStores = new Map();
+
+// ===== CEREBRO COMPARTIDO ÚNICO =====
+const SHARED_CEREBRO_ID = "cerebro_1767052522221"; // ⚠️ Cámbialo si quieres usar otro
 
 console.log('🤖 Bot de Telegram iniciado');
 console.log(`📡 Backend: ${BACKEND_URL}`);
+console.log(`🧠 Cerebro compartido: ${SHARED_CEREBRO_ID}`);
 
 // ===== TRANSCRIPCIÓN DE AUDIO =====
 async function transcribeAudio(audioPath) {
@@ -82,27 +85,51 @@ async function textToSpeech(text) {
 }
 
 // ===== CONSULTAR RAG =====
-async function queryRAG(storeId, query) {
-    const res = await axios.post(`${BACKEND_URL}/chat`, { storeId, query });
+async function queryRAG(query) {
+    const res = await axios.post(`${BACKEND_URL}/chat`, { 
+        storeId: SHARED_CEREBRO_ID, 
+        query 
+    });
     return res.data?.text || "Sin respuesta";
 }
 
+// ===== LISTAR ARCHIVOS =====
+async function getFileCount() {
+    try {
+        const res = await axios.get(`${BACKEND_URL}/files?storeId=${SHARED_CEREBRO_ID}`);
+        return res.data?.totalChunks || 0;
+    } catch {
+        return 0;
+    }
+}
+
 // ===== COMANDOS =====
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
+    const fileCount = await getFileCount();
     bot.sendMessage(msg.chat.id, 
         `¡Hola! 👋\n\n` +
+        `🧠 Cerebro compartido activo\n` +
+        `📚 ${fileCount} documentos disponibles\n\n` +
         `🎤 Envíame un audio y te responderé con voz\n` +
-        `💬 O escribe tu pregunta\n\n` +
-        `Usa /crear para empezar`
+        `💬 O escribe tu pregunta`
     );
 });
 
-bot.onText(/\/crear(.*)/, async (msg, match) => {
-    const name = match[1].trim() || 'MiCerebro';
+bot.onText(/\/info/, async (msg) => {
     try {
-        const res = await axios.post(`${BACKEND_URL}/create-store`, { name });
-        userStores.set(msg.chat.id, res.data.name);
-        bot.sendMessage(msg.chat.id, `✅ Cerebro creado: ${name}`);
+        const res = await axios.get(`${BACKEND_URL}/files?storeId=${SHARED_CEREBRO_ID}`);
+        const files = res.data?.files || [];
+        const totalChunks = res.data?.totalChunks || 0;
+        
+        if (files.length === 0) {
+            bot.sendMessage(msg.chat.id, '⚠️ No hay documentos aún');
+        } else {
+            const fileList = files.map((f, i) => `${i + 1}. ${f}`).join('\n');
+            bot.sendMessage(msg.chat.id, 
+                `📚 Documentos en memoria:\n\n${fileList}\n\n` +
+                `📦 Total chunks: ${totalChunks}`
+            );
+        }
     } catch (err) {
         bot.sendMessage(msg.chat.id, `❌ Error: ${err.message}`);
     }
@@ -110,9 +137,6 @@ bot.onText(/\/crear(.*)/, async (msg, match) => {
 
 // ===== VOZ =====
 bot.on('voice', async (msg) => {
-    const storeId = userStores.get(msg.chat.id);
-    if (!storeId) return bot.sendMessage(msg.chat.id, 'Usa /crear primero');
-    
     let audioPath = null;
     try {
         const file = await bot.getFile(msg.voice.file_id);
@@ -124,7 +148,7 @@ bot.on('voice', async (msg) => {
         const transcription = await transcribeAudio(audioPath);
         bot.sendMessage(msg.chat.id, `📝 "${transcription}"`);
         
-        const answer = await queryRAG(storeId, transcription);
+        const answer = await queryRAG(transcription);
         const ttsPath = await textToSpeech(answer);
         
         if (ttsPath && fs.existsSync(ttsPath)) {
@@ -143,11 +167,9 @@ bot.on('voice', async (msg) => {
 // ===== TEXTO =====
 bot.on('message', async (msg) => {
     if (msg.text?.startsWith('/') || msg.voice || !msg.text) return;
-    const storeId = userStores.get(msg.chat.id);
-    if (!storeId) return bot.sendMessage(msg.chat.id, 'Usa /crear');
     
     try {
-        const answer = await queryRAG(storeId, msg.text);
+        const answer = await queryRAG(msg.text);
         bot.sendMessage(msg.chat.id, answer);
     } catch (err) {
         bot.sendMessage(msg.chat.id, `❌ ${err.message}`);
