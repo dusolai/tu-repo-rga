@@ -1,7 +1,6 @@
 {
-  "name": "telegram-voice-bot-cerebro",
+  "name": "telegram-voice-bot",
   "version": "1.0.0",
-  "description": "Bot de Telegram con entrada y salida de voz",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,9 +9,7 @@
     "node-telegram-bot-api": "^0.66.0",
     "axios": "^1.6.2",
     "form-data": "^4.0.0",
-    "@google/generative-ai": "^0.21.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "@google/generative-ai": "^0.21.0",
+    "express": "^4.19.2"
   }
 }
