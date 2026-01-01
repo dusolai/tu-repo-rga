@@ -218,14 +218,30 @@ app.post('/link-file', async (req, res) => {
         // Referencia al documento del store
         const storeRef = db.collection('stores').doc(storeId);
         
-        // Actualizar información del archivo
-        await storeRef.update({
-            files: admin.firestore.FieldValue.arrayUnion({
-                displayName: fileName,
-                chunkCount: chunks.length,
-                uploadedAt: admin.firestore.FieldValue.serverTimestamp()
-            })
+        // Obtener o crear el documento
+        const storeDoc = await storeRef.get();
+        
+        let filesArray = [];
+        if (storeDoc.exists) {
+            filesArray = storeDoc.data().files || [];
+        } else {
+            // Crear documento nuevo
+            await storeRef.set({
+                name: storeId,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                files: []
+            });
+        }
+        
+        // Añadir nuevo archivo al array manualmente
+        filesArray.push({
+            displayName: fileName,
+            chunkCount: chunks.length,
+            uploadedAt: new Date().toISOString()
         });
+        
+        // Actualizar con el array completo
+        await storeRef.update({ files: filesArray });
         
         // Guardar chunks en subcolección
         const batch = db.batch();
@@ -237,7 +253,7 @@ app.post('/link-file', async (req, res) => {
                 fileName: chunk.fileName,
                 index: chunk.index || index,
                 embedding: chunk.embedding,
-                createdAt: admin.firestore.FieldValue.serverTimestamp()
+                createdAt: new Date().toISOString() // ✅ Usar ISO string
             });
         });
         
