@@ -1,32 +1,40 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleAIFileManager } = require("@google/generative-ai/server");
+const admin = require('firebase-admin');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
 const pdf = require('pdf-parse');
-const admin = require('firebase-admin');
-
-// ===== INICIALIZAR FIREBASE CON PROYECTO CORRECTO =====
-try {
-    admin.initializeApp({
-        projectId: 'entradas24december'  // ✅ PROYECTO CORRECTO
-    });
-    console.log('✅ Firebase Admin inicializado: entradas24december');
-} catch (error) {
-    if (error.code !== 'app/duplicate-app') {
-        console.error('❌ Error inicializando Firebase:', error.message);
-    }
-}
-
-const db = admin.firestore();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// 🏆 EL MEJOR MODELO - SIN LÍMITES
-const CHAT_MODEL = "gemini-2.5-flash";  // El mejor para RAG
-const EMBEDDING_MODEL = "text-embedding-004";
+// --- 1. FIREBASE (Conexión Robusta) ---
+let db = null;
+try {
+    if (process.env.FIREBASE_CREDENTIALS) {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+        db = getFirestore();
+        console.log("🔥 Firebase: CONECTADO");
+    } else {
+        console.warn("⚠️ Firebase: Modo RAM (Sin credenciales)");
+    }
+} catch (e) {
+    console.error("⚠️ Error Firebase:", e.message);
+    db = null;
+}
+
+const STORES_RAM = new Map();
+
+// --- 2. ESTRATEGIA DE MODELOS ---
+// 1º Intentamos el modelo avanzado (2.0)
+// 2º Si falla, usamos el modelo ultra-estable (1.5 Flash)
+const PRIMARY_MODEL = "gemini-2.0-flash-exp";
+const BACKUP_MODEL = "gemini-1.5-flash";
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -43,399 +51,216 @@ const getApiKey = () => {
   return key;
 };
 
-function smartChunk(text, fileName, maxChunkSize = 1000) {
-    const chunks = [];
-    text = text.replace(/\s+/g, ' ').trim();
-    const paragraphs = text.split(/\n{2,}|\. {2,}/);
-    
-    let currentChunk = "";
-    let chunkIndex = 0;
-    
-    for (const para of paragraphs) {
-        if (!para.trim()) continue;
-        
-        if ((currentChunk + para).length > maxChunkSize && currentChunk.length > 0) {
-            chunks.push({
-                id: `${fileName}_chunk_${chunkIndex}`,
-                text: currentChunk.trim(),
-                fileName,
-                index: chunkIndex
-            });
-            chunkIndex++;
-            currentChunk = "";
-        }
-        
-        currentChunk += para + " ";
-        
-        if (currentChunk.length > maxChunkSize) {
-            chunks.push({
-                id: `${fileName}_chunk_${chunkIndex}`,
-                text: currentChunk.trim(),
-                fileName,
-                index: chunkIndex
-            });
-            chunkIndex++;
-            currentChunk = "";
-        }
-    }
-    
-    if (currentChunk.trim().length > 0) {
-        chunks.push({
-            id: `${fileName}_chunk_${chunkIndex}`,
-            text: currentChunk.trim(),
-            fileName,
-            index: chunkIndex
-        });
-    }
-    
-    console.log(`📦 Chunking: ${text.length} chars → ${chunks.length} chunks`);
-    return chunks;
+// --- NÚCLEO: Generación a Prueba de Fallos (Smart Fallback) ---
+async function smartGenerate(apiKey, promptParts) {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  
+  // INTENTO 1: Modelo Nuevo con Archivos Nativos
+  try {
+      // console.log(`Tentativa 1: ${PRIMARY_MODEL} con archivos`);
+      const model = genAI.getGenerativeModel({ model: PRIMARY_MODEL });
+      const result = await model.generateContent(promptParts);
+      return result.response.text();
+  } catch (e1) {
+      console.warn(`⚠️ Falló ${PRIMARY_MODEL} (${e1.message}). Cambiando a estrategia de respaldo...`);
+      
+      // INTENTO 2: Modelo Estable SOLO CON TEXTO (Eliminamos la parte de archivos para evitar errores 404/500)
+      try {
+          // Filtramos las partes que sean archivos (fileData) y dejamos solo el texto plano
+          const textOnlyParts = promptParts.filter(p => !p.fileData);
+          
+          if (textOnlyParts.length === 0) {
+             throw new Error("No hay texto de respaldo para enviar.");
+          }
+
+          // console.log(`Tentativa 2: ${BACKUP_MODEL} solo texto`);
+          const backupModel = genAI.getGenerativeModel({ model: BACKUP_MODEL });
+          const result = await backupModel.generateContent(textOnlyParts);
+          return result.response.text();
+          
+      } catch (e2) {
+          throw new Error(`Error Total: Ni el modelo avanzado ni el de respaldo funcionaron. Detalle: ${e2.message}`);
+      }
+  }
 }
 
-async function generateEmbedding(text, apiKey, retries = 3) {
-    for (let attempt = 1; attempt <= retries; attempt++) {
+app.get('/', (req, res) => res.json({ status: "Online 🟢", logic: "Smart Fallback + Expert Persona" }));
+
+// 1. CREATE STORE
+app.post('/create-store', (req, res) => {
+  const name = req.body.name || "Cerebro"; 
+  const storeId = `cerebro_${Date.now()}`;
+  res.json({ name: storeId }); 
+
+  (async () => {
+    STORES_RAM.set(storeId, { name, files: [], texts: [] });
+    if (db) {
         try {
-            const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
-            const result = await model.embedContent(text);
-            return result.embedding.values;
-        } catch (e) {
-            if (e.message.includes('429') && attempt < retries) {
-                console.log(`⏳ Reintentando en ${2 * attempt}s...`);
-                await new Promise(r => setTimeout(r, 2000 * attempt));
-                continue;
-            }
-            if (attempt === retries) {
-                console.error('❌ Error generando embedding:', e.message);
-                return null;
-            }
-        }
+            await db.collection('stores').doc(storeId).set({ name, createdAt: new Date(), files: [], texts: [] });
+        } catch(e) { console.error("DB Create Error:", e.message); }
     }
-    return null;
-}
-
-function cosineSimilarity(vecA, vecB) {
-    if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
-    
-    let dotProduct = 0, normA = 0, normB = 0;
-    
-    for (let i = 0; i < vecA.length; i++) {
-        dotProduct += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
-        normB += vecB[i] * vecB[i];
-    }
-    
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-function keywordScore(query, text) {
-    const queryWords = query.toLowerCase().split(/\s+/);
-    const textLower = text.toLowerCase();
-    
-    let score = 0;
-    for (const word of queryWords) {
-        if (word.length < 3) continue;
-        const occurrences = (textLower.match(new RegExp(word, 'g')) || []).length;
-        score += occurrences;
-    }
-    
-    return score;
-}
-
-app.get('/', (req, res) => res.json({ 
-    status: "Online 🟢",
-    version: "25.0.0 - PREMIUM (entradas24december)",
-    models: { 
-        chat: CHAT_MODEL + " 🏆", 
-        embedding: EMBEDDING_MODEL 
-    },
-    database: "Firestore ✅",
-    project: "entradas24december",
-    mode: "UNLIMITED - Best Performance"
-}));
-
-app.post('/create-store', async (req, res) => {
-    try {
-        const storeId = `cerebro_${Date.now()}`;
-        
-        await db.collection('stores').doc(storeId).set({
-            name: req.body.name || storeId,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            files: []
-        });
-        
-        console.log(`✅ Store creado en Firestore (entradas24december): ${storeId}`);
-        res.json({ name: storeId });
-    } catch (error) {
-        console.error('❌ Error creando store:', error);
-        res.status(500).json({ error: error.message });
-    }
+  })();
 });
 
+// 2. UPLOAD (Guarda Archivo Nube + Texto Local)
 app.post('/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file' });
+    
+    // 1. SIEMPRE extraemos texto (Es nuestro seguro de vida)
+    const buffer = fs.readFileSync(req.file.path);
+    let extractedText = "";
+    if (req.file.mimetype.includes('pdf')) {
+      try { const data = await pdf(buffer); extractedText = data.text; } catch (e) {}
+    } else { extractedText = buffer.toString('utf-8'); }
+    
+    // Limpiamos y limitamos para no saturar tokens
+    extractedText = extractedText.replace(/\s+/g, ' ').substring(0, 80000); 
+
+    // 2. Intentamos subir a Google (Para usar el modelo avanzado multimodal)
+    let googleFile = null;
     try {
-        if (!req.file) return res.status(400).json({ error: 'No file' });
-        
         const apiKey = getApiKey();
-        const fileName = req.file.originalname;
+        const fileManager = new GoogleAIFileManager(apiKey);
+        const uploadResponse = await fileManager.uploadFile(req.file.path, { mimeType: req.file.mimetype, displayName: req.file.originalname });
         
-        console.log(`📤 Procesando: ${fileName}`);
-        
-        const buffer = fs.readFileSync(req.file.path);
-        let extractedText = "";
-        
-        if (req.file.mimetype.includes('pdf')) {
-            const data = await pdf(buffer);
-            extractedText = data.text;
-        } else {
-            extractedText = buffer.toString('utf-8');
+        // Esperamos brevemente a que procese para que esté listo al instante
+        let attempts = 0;
+        let fileState = uploadResponse.file.state;
+        while(fileState === "PROCESSING" && attempts < 5) {
+            await new Promise(r => setTimeout(r, 500));
+            const f = await fileManager.getFile(uploadResponse.file.name);
+            fileState = f.state;
+            attempts++;
         }
-        
-        const chunks = smartChunk(extractedText, fileName);
-        const chunksWithEmbeddings = [];
-        
-        for (const chunk of chunks) {
-            const embedding = await generateEmbedding(chunk.text, apiKey);
-            chunksWithEmbeddings.push({ ...chunk, embedding });
-            await new Promise(r => setTimeout(r, 200));
+
+        if (fileState === "ACTIVE") {
+            googleFile = { 
+                uri: uploadResponse.file.uri, 
+                name: uploadResponse.file.name, 
+                mimeType: uploadResponse.file.mimeType,
+                displayName: req.file.originalname
+            };
         }
-        
-        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        
-        res.json({
-            file: {
-                fileName,
-                chunkCount: chunks.length,
-                chunks: chunksWithEmbeddings
-            }
-        });
-    } catch (error) {
-        console.error('❌ Error en upload:', error);
-        res.status(500).json({ error: error.message });
-    }
+    } catch (e) { console.warn("Upload IA Error (Usaremos texto como respaldo):", e.message); }
+
+    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+
+    res.json({ file: { uri: googleFile ? googleFile.uri : `memory://${req.file.originalname}`, googleData: googleFile, extractedText } });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-app.post('/link-file', async (req, res) => {
-    try {
-        const { storeId, fileName, chunks } = req.body;
-        
-        if (!storeId || !fileName || !chunks) {
-            return res.status(400).json({ error: 'Datos inválidos' });
+// 3. LINK FILE
+app.post('/link-file', (req, res) => {
+  res.json({ success: true });
+
+  const { storeId, fileName, extractedText, googleData } = req.body;
+  (async () => {
+      try {
+        if (!STORES_RAM.has(storeId)) STORES_RAM.set(storeId, { name: "Recuperado", files: [], texts: [] });
+        const ramStore = STORES_RAM.get(storeId);
+        ramStore.texts.push({ fileName, text: extractedText }); // Guardamos texto
+        if (googleData && googleData.uri) ramStore.files.push(googleData); // Guardamos ref de Google
+
+        if (db) {
+            const storeRef = db.collection('stores').doc(storeId);
+            const doc = await storeRef.get();
+            if (!doc.exists) await storeRef.set({ name: "Recuperado", createdAt: new Date(), files: [], texts: [] });
+
+            const updates = { texts: FieldValue.arrayUnion({ fileName, text: extractedText }) };
+            if (googleData && googleData.uri) updates.files = FieldValue.arrayUnion(googleData);
+            await storeRef.update(updates);
+            console.log(`💾 Guardado en DB: ${fileName}`);
         }
-        
-        console.log(`💾 Guardando ${chunks.length} chunks en Firestore (entradas24december) para ${storeId}`);
-        
-        const storeRef = db.collection('stores').doc(storeId);
-        const storeDoc = await storeRef.get();
-        
-        let filesArray = [];
-        if (storeDoc.exists) {
-            filesArray = storeDoc.data().files || [];
-        } else {
-            await storeRef.set({
-                name: storeId,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                files: []
-            });
-        }
-        
-        filesArray.push({
-            displayName: fileName,
-            chunkCount: chunks.length,
-            uploadedAt: new Date().toISOString()
-        });
-        
-        await storeRef.update({ files: filesArray });
-        
-        // Guardar chunks en batch
-        const batch = db.batch();
-        
-        chunks.forEach((chunk, index) => {
-            const chunkRef = storeRef.collection('chunks').doc(`${fileName}_${index}`);
-            batch.set(chunkRef, {
-                text: chunk.text,
-                fileName: chunk.fileName,
-                index: chunk.index || index,
-                embedding: chunk.embedding,
-                createdAt: new Date().toISOString()
-            });
-        });
-        
-        await batch.commit();
-        
-        console.log(`✅ ${chunks.length} chunks guardados en Firestore (entradas24december)`);
-        
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ Error en link-file:', error);
-        res.status(500).json({ error: error.message });
-    }
+      } catch (e) { console.error(`BG Error: ${e.message}`); }
+  })();
 });
 
+// 4. CHAT (CON PERSONALIDAD "CEREBRO DIEGO")
 app.post('/chat', async (req, res) => {
-    try {
-        const { storeId, query } = req.body;
-        const apiKey = getApiKey();
-        
-        console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
-        
-        // Leer chunks desde Firestore
-        const chunksSnapshot = await db.collection('stores')
-            .doc(storeId)
-            .collection('chunks')
-            .get();
-        
-        if (chunksSnapshot.empty) {
-            console.log(`⚠️ No hay chunks en ${storeId}`);
-            return res.json({ 
-                text: "⚠️ No hay documentos indexados en este cerebro.",
-                sources: []
-            });
-        }
-        
-        const chunks = [];
-        chunksSnapshot.forEach(doc => {
-            chunks.push(doc.data());
-        });
-        
-        console.log(`📚 Recuperados ${chunks.length} chunks de Firestore (entradas24december)`);
-        
-        const queryEmbedding = await generateEmbedding(query, apiKey);
-        
-        if (!queryEmbedding) {
-            console.log('⚠️ No se pudo generar embedding, usando solo keywords');
-            const scoredChunks = chunks.map(chunk => ({
-                ...chunk,
-                finalScore: keywordScore(query, chunk.text)
-            }));
-            
-            const topChunks = scoredChunks
-                .sort((a, b) => b.finalScore - a.finalScore)
-                .slice(0, 5);
-            
-            return res.json({
-                text: "⚠️ Búsqueda limitada. Documentos relevantes:\n\n" +
-                      topChunks.map((c, i) => 
-                          `${i+1}. **${c.fileName}** (Keywords: ${c.finalScore})`
-                      ).join('\n'),
-                sources: topChunks.map(c => ({
-                    fileName: c.fileName,
-                    score: c.finalScore.toFixed(3)
-                }))
-            });
-        }
-        
-        const scoredChunks = chunks.map(chunk => {
-            const semanticScore = cosineSimilarity(queryEmbedding, chunk.embedding);
-            const keywordScoreVal = keywordScore(query, chunk.text);
-            const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
-            
-            return { ...chunk, finalScore, semanticScore };
-        });
-        
-        const topChunks = scoredChunks
-            .sort((a, b) => b.finalScore - a.finalScore)
-            .slice(0, 5);
-        
-        console.log(`🎯 Top 5 chunks: ${topChunks.map(c => `${c.fileName} (${(c.semanticScore * 100).toFixed(1)}%)`).join(', ')}`);
-        
-        const context = topChunks
-            .map(c => `[Fuente: ${c.fileName}]\n${c.text}`)
-            .join('\n\n---\n\n');
-        
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
-        
-        const prompt = `Eres un asistente experto que responde preguntas basándose ÚNICAMENTE en el contexto proporcionado.
+  try {
+      const { storeId, query } = req.body;
+      let storeData = STORES_RAM.get(storeId);
 
-CONTEXTO DE LOS DOCUMENTOS:
-${context}
+      // Recuperación DB
+      if (!storeData && db) {
+          try {
+              const doc = await db.collection('stores').doc(storeId).get();
+              if (doc.exists) {
+                  storeData = doc.data();
+                  if (!storeData.files) storeData.files = [];
+                  if (!storeData.texts) storeData.texts = [];
+                  STORES_RAM.set(storeId, storeData);
+              }
+          } catch (e) { console.error("DB Read Error:", e.message); }
+      }
 
-PREGUNTA DEL USUARIO: ${query}
+      if (!storeData) return res.json({ text: "⚠️ No hay documentos. Sube uno primero." });
 
-INSTRUCCIONES:
-- Responde SOLO con información que aparezca explícitamente en el contexto
-- Si la respuesta no está en el contexto, di claramente: "No encuentro esa información en los documentos"
-- Sé preciso, claro y útil
-- Cita las fuentes relevantes entre paréntesis
-- Si hay múltiples partes relevantes, organiza la información de forma coherente
+      const apiKey = getApiKey();
+      let promptParts = [];
+      
+      const validFiles = (storeData.files || []).filter(f => f && f.uri && f.mimeType);
+      const validTexts = (storeData.texts || []).filter(t => t && t.text);
 
-RESPUESTA:`;
+      // === DEFINICIÓN DE PERSONALIDAD ===
+      promptParts.push({ text: `
+      ACTÚA COMO: Un analista experto y consultor estratégico llamado "Cerebro Diego".
+      
+      TU MISIÓN: Responder a la pregunta del usuario basándote ESTRICTAMENTE en la información proporcionada en los documentos adjuntos.
+      
+      ESTILO DE RESPUESTA:
+      1. Directo y profesional, pero accesible.
+      2. Estructura la respuesta con puntos clave, negritas o listas si es necesario para facilitar la lectura.
+      3. Si la información aparece en varios documentos, sintetízala en una visión global.
+      4. CITA SIEMPRE LAS FUENTES AL FINAL O ENTRE PARÉNTESIS. Ejemplo: "...esto se confirma en el informe anual (Fuente: informe_2024.pdf)".
+      5. Si la información NO está en los documentos, dilo claramente: "No encuentro esa información específica en los documentos disponibles." (No inventes).
+      
+      A CONTINUACIÓN, LOS DOCUMENTOS DE CONTEXTO:
+      `});
 
-        try {
-            console.log(`🤖 Llamando a ${CHAT_MODEL}...`);
-            
-            const result = await model.generateContent(prompt);
-            const answer = result.response.text();
-            
-            console.log(`✅ Respuesta generada (${answer.length} chars)`);
-            
-            res.json({
-                text: answer,
-                sources: topChunks.map(c => ({
-                    fileName: c.fileName,
-                    score: c.finalScore.toFixed(3),
-                    semanticMatch: `${(c.semanticScore * 100).toFixed(1)}%`
-                }))
-            });
-            
-        } catch (error) {
-            console.error(`❌ Error con ${CHAT_MODEL}:`, error.message);
-            
-            // Fallback: devolver chunks más relevantes
-            res.json({
-                text: `⚠️ Error generando respuesta, pero encontré estos documentos relevantes:\n\n` +
-                      topChunks.map((c, i) => 
-                          `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)\n${c.text.substring(0, 300)}...`
-                      ).join('\n\n'),
-                sources: topChunks.map(c => ({
-                    fileName: c.fileName,
-                    score: c.finalScore.toFixed(3)
-                }))
-            });
-        }
-        
-    } catch (error) {
-        console.error("❌ Error en chat:", error);
-        res.status(500).json({ 
-            text: `❌ Error: ${error.message}`,
-            sources: []
-        });
-    }
+      // Parte 1: Archivos (Para el modelo avanzado)
+      if (validFiles.length > 0) {
+          validFiles.slice(-5).forEach(f => {
+              promptParts.push({ fileData: { mimeType: f.mimeType, fileUri: f.uri } });
+          });
+      } 
+      
+      // Parte 2: Texto (Para el modelo de respaldo O contexto extra)
+      if (validTexts.length > 0) {
+          const context = validTexts.map(t => `--- DOCUMENTO: ${t.fileName} ---\n${t.text}`).join('\n\n');
+          promptParts.push({ text: `\nCONTENIDO DE TEXTO EXTRAÍDO (Usar si no puedes leer los adjuntos):\n${context}` });
+      }
+
+      promptParts.push({ text: `\nPREGUNTA DEL USUARIO: ${query}` });
+
+      // EJECUCIÓN INTELIGENTE (Smart Fallback)
+      const answer = await smartGenerate(apiKey, promptParts);
+      res.json({ text: answer });
+      
+  } catch (e) { 
+      console.error("Chat Fatal Error:", e);
+      res.json({ text: `❌ Error irrecuperable: ${e.message}. Por favor, revisa tu API Key.` }); 
+  }
 });
 
+// 5. LIST FILES
 app.get('/files', async (req, res) => {
-    try {
-        const { storeId } = req.query;
-        
-        const storeDoc = await db.collection('stores').doc(storeId).get();
-        
-        if (!storeDoc.exists) {
-            return res.json({ files: [], totalChunks: 0 });
-        }
-        
-        const storeData = storeDoc.data();
-        const files = storeData.files || [];
-        
-        const chunksSnapshot = await db.collection('stores')
-            .doc(storeId)
-            .collection('chunks')
-            .get();
-        
-        res.json({ 
-            files: files.map(f => f.displayName),
-            totalChunks: chunksSnapshot.size
-        });
-    } catch (error) {
-        console.error('❌ Error listando archivos:', error);
-        res.json({ files: [], totalChunks: 0 });
+    const { storeId } = req.query;
+    if (!storeId) return res.json({ files: [] });
+    let storeData = STORES_RAM.get(storeId);
+    if (!storeData && db) {
+        try {
+            const doc = await db.collection('stores').doc(storeId).get();
+            if (doc.exists) { storeData = doc.data(); STORES_RAM.set(storeId, storeData); }
+        } catch (e) {}
     }
+    if (!storeData) return res.json({ files: [] });
+    const fileNames = [
+        ...(storeData.files || []).map(f => f ? (f.displayName || f.name) : null),
+        ...(storeData.texts || []).map(t => t ? t.fileName : null)
+    ];
+    res.json({ files: [...new Set(fileNames.filter(Boolean))] });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Backend v25.0.0 - PREMIUM MODE`);
-  console.log(`🏆 Modelo: ${CHAT_MODEL} (El mejor)`);
-  console.log(`💾 Base de datos: Firestore (entradas24december)`);
-  console.log(`⚡ Sin límites de cuota - Máximo rendimiento`);
-  console.log(`✅ Puerto: ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Servidor Final (Cerebro Diego) listo en ${PORT}`));
