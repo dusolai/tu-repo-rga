@@ -9,7 +9,7 @@ const admin = require('firebase-admin');
 // ===== INICIALIZAR FIREBASE CON PROYECTO CORRECTO =====
 try {
     admin.initializeApp({
-        projectId: 'entradas24december'  // ✅ PROYECTO CORRECTO
+        projectId: 'entradas24december'
     });
     console.log('✅ Firebase Admin inicializado: entradas24december');
 } catch (error) {
@@ -24,9 +24,13 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// MODELO CON LÍMITES ALTOS Y CUOTA DISPONIBLE
-const CHAT_MODEL = "gemini-2.5-flash";
+// ✅ USAR MODELO MÁS ECONÓMICO PERO EFECTIVO
+const CHAT_MODEL = "gemini-1.5-flash-8b"; // Modelo más económico
 const EMBEDDING_MODEL = "text-embedding-004";
+
+// Cache simple en memoria para reducir llamadas
+const queryCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -101,10 +105,14 @@ async function generateEmbedding(text, apiKey, retries = 3) {
             return result.embedding.values;
         } catch (e) {
             if (e.message.includes('429') && attempt < retries) {
+                console.log(`⏳ Cuota alcanzada, esperando ${2 * attempt}s...`);
                 await new Promise(r => setTimeout(r, 2000 * attempt));
                 continue;
             }
-            if (attempt === retries) return null;
+            if (attempt === retries) {
+                console.error('❌ No se pudo generar embedding después de reintentos');
+                return null;
+            }
         }
     }
     return null;
@@ -140,17 +148,25 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "23.1.0 - FIRESTORE PERSISTENCE (entradas24december)",
-    models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL },
+    version: "24.0.0 - OPTIMIZED (entradas24december)",
+    models: { 
+        chat: CHAT_MODEL, 
+        embedding: EMBEDDING_MODEL 
+    },
     database: "Firestore ✅",
-    project: "entradas24december"
+    project: "entradas24december",
+    features: [
+        "Cache de queries (5min TTL)",
+        "Modelo económico (gemini-1.5-flash-8b)",
+        "Reintentos automáticos con backoff",
+        "Respuestas acortadas si superan límite"
+    ]
 }));
 
 app.post('/create-store', async (req, res) => {
     try {
         const storeId = `cerebro_${Date.now()}`;
         
-        // Guardar en Firestore
         await db.collection('stores').doc(storeId).set({
             name: req.body.name || storeId,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -190,7 +206,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         for (const chunk of chunks) {
             const embedding = await generateEmbedding(chunk.text, apiKey);
             chunksWithEmbeddings.push({ ...chunk, embedding });
-            await new Promise(r => setTimeout(r, 200));
+            // Pausa más larga para evitar cuotas
+            await new Promise(r => setTimeout(r, 500));
         }
         
         if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -218,17 +235,13 @@ app.post('/link-file', async (req, res) => {
         
         console.log(`💾 Guardando ${chunks.length} chunks en Firestore (entradas24december) para ${storeId}`);
         
-        // Referencia al documento del store
         const storeRef = db.collection('stores').doc(storeId);
-        
-        // Obtener o crear el documento
         const storeDoc = await storeRef.get();
         
         let filesArray = [];
         if (storeDoc.exists) {
             filesArray = storeDoc.data().files || [];
         } else {
-            // Crear documento nuevo
             await storeRef.set({
                 name: storeId,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -236,17 +249,15 @@ app.post('/link-file', async (req, res) => {
             });
         }
         
-        // Añadir nuevo archivo al array manualmente
         filesArray.push({
             displayName: fileName,
             chunkCount: chunks.length,
             uploadedAt: new Date().toISOString()
         });
         
-        // Actualizar con el array completo
         await storeRef.update({ files: filesArray });
         
-        // Guardar chunks en subcolección
+        // Guardar chunks en batch
         const batch = db.batch();
         
         chunks.forEach((chunk, index) => {
@@ -278,6 +289,18 @@ app.post('/chat', async (req, res) => {
         
         console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
         
+        // Verificar cache
+        const cacheKey = `${storeId}:${query.toLowerCase().trim()}`;
+        if (queryCache.has(cacheKey)) {
+            const cached = queryCache.get(cacheKey);
+            if (Date.now() - cached.timestamp < CACHE_TTL) {
+                console.log('📦 Respuesta desde cache');
+                return res.json(cached.data);
+            } else {
+                queryCache.delete(cacheKey);
+            }
+        }
+        
         // Leer chunks desde Firestore
         const chunksSnapshot = await db.collection('stores')
             .doc(storeId)
@@ -301,11 +324,34 @@ app.post('/chat', async (req, res) => {
         
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
-        const scoredChunks = chunks.map(chunk => {
-            const semanticScore = queryEmbedding && chunk.embedding 
-                ? cosineSimilarity(queryEmbedding, chunk.embedding)
-                : 0;
+        if (!queryEmbedding) {
+            // Si no se puede generar embedding, usar solo keywords
+            console.log('⚠️ Usando solo búsqueda por keywords');
+            const scoredChunks = chunks.map(chunk => ({
+                ...chunk,
+                finalScore: keywordScore(query, chunk.text)
+            }));
             
+            const topChunks = scoredChunks
+                .sort((a, b) => b.finalScore - a.finalScore)
+                .slice(0, 3);
+            
+            const responseData = {
+                text: "⚠️ Búsqueda limitada por cuota de API. Documentos relevantes:\n\n" +
+                      topChunks.map((c, i) => 
+                          `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 10).toFixed(0)}%)\n${c.text.substring(0, 200)}...`
+                      ).join('\n\n'),
+                sources: topChunks.map(c => ({
+                    fileName: c.fileName,
+                    score: c.finalScore.toFixed(3)
+                }))
+            };
+            
+            return res.json(responseData);
+        }
+        
+        const scoredChunks = chunks.map(chunk => {
+            const semanticScore = cosineSimilarity(queryEmbedding, chunk.embedding);
             const keywordScoreVal = keywordScore(query, chunk.text);
             const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
             
@@ -325,20 +371,8 @@ app.post('/chat', async (req, res) => {
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
-        const prompt = `Eres un asistente que responde preguntas basándose ÚNICAMENTE en el contexto proporcionado.
-
-CONTEXTO:
-${context}
-
-PREGUNTA: ${query}
-
-INSTRUCCIONES:
-- Responde SOLO con información que aparezca explícitamente en el contexto
-- Si la respuesta no está en el contexto, di: "No encuentro esa información en los documentos"
-- Sé preciso y conciso
-- Menciona las fuentes relevantes
-
-RESPUESTA:`;
+        // Prompt más corto para ahorrar tokens
+        const prompt = `Contexto:\n${context}\n\nPregunta: ${query}\n\nResponde de forma concisa basándote solo en el contexto:`;
 
         try {
             console.log(`🤖 Llamando a ${CHAT_MODEL}...`);
@@ -346,28 +380,46 @@ RESPUESTA:`;
             const result = await model.generateContent(prompt);
             const answer = result.response.text();
             
-            console.log(`✅ Respuesta generada: ${answer.substring(0, 100)}...`);
+            // Limitar respuesta si es muy larga
+            const maxLength = 1500;
+            const finalAnswer = answer.length > maxLength 
+                ? answer.substring(0, maxLength) + '\n\n... (respuesta acortada por límites)' 
+                : answer;
             
-            res.json({
-                text: answer,
+            console.log(`✅ Respuesta generada: ${finalAnswer.substring(0, 100)}...`);
+            
+            const responseData = {
+                text: finalAnswer,
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
                     score: c.finalScore.toFixed(3)
                 }))
+            };
+            
+            // Guardar en cache
+            queryCache.set(cacheKey, {
+                data: responseData,
+                timestamp: Date.now()
             });
+            
+            res.json(responseData);
             
         } catch (error) {
             console.error(`❌ Error con ${CHAT_MODEL}:`, error.message);
             
-            res.json({
-                text: `⚠️ Error del modelo: ${error.message}\n\nPero encontré estos documentos relevantes:\n\n${topChunks.map((c, i) => 
-                    `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)`
-                ).join('\n')}`,
+            // Respuesta de fallback sin llamar al modelo
+            const fallbackResponse = {
+                text: `Documentos relevantes encontrados:\n\n` +
+                      topChunks.map((c, i) => 
+                          `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)`
+                      ).join('\n'),
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
                     score: c.finalScore.toFixed(3)
                 }))
-            });
+            };
+            
+            res.json(fallbackResponse);
         }
         
     } catch (error) {
@@ -407,9 +459,21 @@ app.get('/files', async (req, res) => {
     }
 });
 
+// Limpiar cache cada 10 minutos
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of queryCache.entries()) {
+        if (now - value.timestamp > CACHE_TTL) {
+            queryCache.delete(key);
+        }
+    }
+    console.log(`🧹 Cache limpiado: ${queryCache.size} entradas activas`);
+}, 10 * 60 * 1000);
+
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v23.1.0 - FIRESTORE PERSISTENCE`);
-  console.log(`🤖 Modelo: ${CHAT_MODEL}`);
+  console.log(`🚀 Backend v24.0.0 - OPTIMIZED`);
+  console.log(`🤖 Modelo: ${CHAT_MODEL} (económico)`);
   console.log(`💾 Base de datos: Firestore (entradas24december)`);
+  console.log(`📦 Cache: Activo (5min TTL)`);
   console.log(`✅ Puerto: ${PORT}`);
 });
