@@ -14,16 +14,16 @@ try {
     console.log('✅ Firebase: entradas24december');
 } catch (error) {
     if (error.code !== 'app/duplicate-app') {
-        console.error('❌ Firebase error:', error.message);
+        console.error('❌ Firebase:', error.message);
     }
 }
 
 const db = admin.firestore();
-
 const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
+// 🏆 MODELO PREMIUM
 const CHAT_MODEL = "gemini-2.5-flash";
 const EMBEDDING_MODEL = "text-embedding-004";
 
@@ -42,6 +42,7 @@ const getApiKey = () => {
   return key;
 };
 
+// ===== CHUNKING =====
 function smartChunk(text, fileName, maxChunkSize = 1000) {
     const chunks = [];
     text = text.replace(/\s+/g, ' ').trim();
@@ -87,10 +88,10 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
         });
     }
     
-    console.log(`📦 Chunks: ${chunks.length}`);
     return chunks;
 }
 
+// ===== EMBEDDINGS =====
 async function generateEmbedding(text, apiKey, retries = 3) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
@@ -99,16 +100,21 @@ async function generateEmbedding(text, apiKey, retries = 3) {
             const result = await model.embedContent(text);
             return result.embedding.values;
         } catch (e) {
+            console.error(`❌ Embedding intento ${attempt}:`, e.message);
             if (e.message.includes('429') && attempt < retries) {
-                await new Promise(r => setTimeout(r, 2000 * attempt));
+                const waitTime = 2000 * attempt;
+                console.log(`⏳ Esperando ${waitTime}ms...`);
+                await new Promise(r => setTimeout(r, waitTime));
                 continue;
             }
-            if (attempt === retries) return null;
+            if (attempt === retries) {
+                throw new Error(`Fallo generando embedding después de ${retries} intentos`);
+            }
         }
     }
-    return null;
 }
 
+// ===== SIMILITUD =====
 function cosineSimilarity(vecA, vecB) {
     if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
     
@@ -123,42 +129,25 @@ function cosineSimilarity(vecA, vecB) {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function keywordScore(query, text) {
-    const queryWords = query.toLowerCase().split(/\s+/);
-    const textLower = text.toLowerCase();
-    
-    let score = 0;
-    for (const word of queryWords) {
-        if (word.length < 3) continue;
-        const occurrences = (textLower.match(new RegExp(word, 'g')) || []).length;
-        score += occurrences;
-    }
-    
-    return score;
-}
-
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "26.0.0 - FIXED",
+    version: "27.0.0 - CEREBRO OPTIMIZADO",
     models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL },
-    database: "Firestore ✅",
     project: "entradas24december"
 }));
 
 app.post('/create-store', async (req, res) => {
     try {
         const storeId = `cerebro_${Date.now()}`;
-        
         await db.collection('stores').doc(storeId).set({
             name: req.body.name || storeId,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             files: []
         });
-        
         console.log(`✅ Store: ${storeId}`);
         res.json({ name: storeId });
     } catch (error) {
-        console.error('❌ Error:', error);
+        console.error('❌ Create:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -188,7 +177,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         for (const chunk of chunks) {
             const embedding = await generateEmbedding(chunk.text, apiKey);
             chunksWithEmbeddings.push({ ...chunk, embedding });
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 300)); // Evitar rate limit
         }
         
         if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -239,7 +228,6 @@ app.post('/link-file', async (req, res) => {
         await storeRef.update({ files: filesArray });
         
         const batch = db.batch();
-        
         chunks.forEach((chunk, index) => {
             const chunkRef = storeRef.collection('chunks').doc(`${fileName}_${index}`);
             batch.set(chunkRef, {
@@ -252,9 +240,7 @@ app.post('/link-file', async (req, res) => {
         });
         
         await batch.commit();
-        
         console.log(`✅ Guardado`);
-        
         res.json({ success: true });
     } catch (error) {
         console.error('❌ Link:', error);
@@ -262,125 +248,98 @@ app.post('/link-file', async (req, res) => {
     }
 });
 
+// ===== CHAT - SIN FALLBACKS INNECESARIOS =====
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
         const apiKey = getApiKey();
         
-        console.log(`💬 "${query}"`);
+        console.log(`\n💬 Consulta: "${query}"`);
         
+        // 1. OBTENER CHUNKS
         const chunksSnapshot = await db.collection('stores')
             .doc(storeId)
             .collection('chunks')
             .get();
         
         if (chunksSnapshot.empty) {
-            console.log(`⚠️ Sin chunks`);
             return res.json({ 
-                text: "⚠️ No hay documentos indexados.",
+                text: "⚠️ No hay documentos indexados en este cerebro. Sube archivos primero.",
                 sources: []
             });
         }
         
         const chunks = [];
-        chunksSnapshot.forEach(doc => {
-            chunks.push(doc.data());
-        });
+        chunksSnapshot.forEach(doc => chunks.push(doc.data()));
+        console.log(`📚 ${chunks.length} chunks disponibles`);
         
-        console.log(`📚 ${chunks.length} chunks`);
-        
+        // 2. GENERAR EMBEDDING DE LA CONSULTA
+        console.log(`🔢 Generando embedding de consulta...`);
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
-        if (!queryEmbedding) {
-            const scoredChunks = chunks.map(chunk => ({
-                ...chunk,
-                finalScore: keywordScore(query, chunk.text)
-            }));
-            
-            const topChunks = scoredChunks
-                .sort((a, b) => b.finalScore - a.finalScore)
-                .slice(0, 5);
-            
-            return res.json({
-                text: "Documentos relevantes:\n\n" +
-                      topChunks.map((c, i) => 
-                          `${i+1}. ${c.fileName}`
-                      ).join('\n'),
-                sources: topChunks.map(c => ({
-                    fileName: c.fileName,
-                    score: c.finalScore.toFixed(3)
-                }))
-            });
-        }
-        
+        // 3. CALCULAR SIMILITUD
+        console.log(`🎯 Calculando similitudes...`);
         const scoredChunks = chunks.map(chunk => {
-            const semanticScore = cosineSimilarity(queryEmbedding, chunk.embedding);
-            const keywordScoreVal = keywordScore(query, chunk.text);
-            const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
-            
-            return { ...chunk, finalScore, semanticScore };
+            const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
+            return { ...chunk, similarity };
         });
         
+        // 4. TOP 5 CHUNKS
         const topChunks = scoredChunks
-            .sort((a, b) => b.finalScore - a.finalScore)
+            .sort((a, b) => b.similarity - a.similarity)
             .slice(0, 5);
         
-        console.log(`🎯 Top: ${topChunks.map(c => `${(c.semanticScore * 100).toFixed(0)}%`).join(', ')}`);
+        console.log(`📊 Top 5 chunks:`);
+        topChunks.forEach((c, i) => {
+            console.log(`  ${i+1}. ${c.fileName} - ${(c.similarity * 100).toFixed(1)}%`);
+        });
         
+        // 5. CONSTRUIR CONTEXTO
         const context = topChunks
-            .map(c => `[${c.fileName}]\n${c.text}`)
+            .map(c => `[Documento: ${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
+        // 6. PROMPT OPTIMIZADO
+        const prompt = `Eres Cerebro Diego, un asistente experto que responde preguntas basándose ÚNICAMENTE en documentos.
+
+**REGLAS ESTRICTAS:**
+1. Responde SOLO con información que aparece en el contexto
+2. Si la info no está, di: "No encuentro esa información en los documentos"
+3. Sé directo y útil, sin rodeos
+4. NO inventes ni supongas nada
+5. Cita las fuentes relevantes
+
+**CONTEXTO DE LOS DOCUMENTOS:**
+${context}
+
+**PREGUNTA:** ${query}
+
+**TU RESPUESTA (directa y basada en los documentos):**`;
+
+        // 7. GENERAR RESPUESTA
+        console.log(`🤖 Generando respuesta con ${CHAT_MODEL}...`);
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
-        const prompt = `Eres Cerebro Diego, un asistente experto.
-
-CONTEXTO:
-${context}
-
-PREGUNTA: ${query}
-
-INSTRUCCIONES:
-- Responde SOLO con información del contexto
-- Si no está, di "No encuentro esa información"
-- Sé claro y preciso
-- Cita fuentes entre paréntesis
-
-RESPUESTA:`;
-
-        try {
-            const result = await model.generateContent(prompt);
-            const answer = result.response.text();
-            
-            res.json({
-                text: answer,
-                sources: topChunks.map(c => ({
-                    fileName: c.fileName,
-                    score: c.finalScore.toFixed(3),
-                    semanticMatch: `${(c.semanticScore * 100).toFixed(0)}%`
-                }))
-            });
-            
-        } catch (error) {
-            console.error(`❌ Modelo:`, error.message);
-            
-            res.json({
-                text: `Documentos relevantes:\n\n` +
-                      topChunks.map((c, i) => 
-                          `${i+1}. **${c.fileName}** (${(c.finalScore * 100).toFixed(0)}%)\n${c.text.substring(0, 200)}...`
-                      ).join('\n\n'),
-                sources: topChunks.map(c => ({
-                    fileName: c.fileName,
-                    score: c.finalScore.toFixed(3)
-                }))
-            });
-        }
+        const result = await model.generateContent(prompt);
+        const answer = result.response.text();
+        
+        console.log(`✅ Respuesta generada (${answer.length} chars)\n`);
+        
+        res.json({
+            text: answer,
+            sources: topChunks.map(c => ({
+                fileName: c.fileName,
+                similarity: `${(c.similarity * 100).toFixed(1)}%`
+            }))
+        });
         
     } catch (error) {
-        console.error("❌ Chat:", error);
+        console.error("❌ Error en chat:", error.message);
+        
+        // SOLO EN CASO DE ERROR CRÍTICO
         res.status(500).json({ 
-            text: `❌ Error: ${error.message}`,
+            text: `❌ Error procesando tu consulta: ${error.message}\n\nIntenta de nuevo en unos segundos.`,
             sources: []
         });
     }
@@ -389,7 +348,6 @@ RESPUESTA:`;
 app.get('/files', async (req, res) => {
     try {
         const { storeId } = req.query;
-        
         const storeDoc = await db.collection('stores').doc(storeId).get();
         
         if (!storeDoc.exists) {
@@ -415,8 +373,8 @@ app.get('/files', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v26.0.0 FIXED`);
-  console.log(`🤖 ${CHAT_MODEL}`);
-  console.log(`💾 Firestore (entradas24december)`);
-  console.log(`✅ Puerto: ${PORT}`);
+  console.log(`\n🚀 Cerebro Diego Backend v27.0.0`);
+  console.log(`🤖 Modelo: ${CHAT_MODEL}`);
+  console.log(`💾 Firebase: entradas24december`);
+  console.log(`✅ Puerto: ${PORT}\n`);
 });
