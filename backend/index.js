@@ -6,10 +6,12 @@ const os = require('os');
 const pdf = require('pdf-parse');
 const admin = require('firebase-admin');
 
-// ===== INICIALIZAR FIREBASE =====
+// ===== INICIALIZAR FIREBASE CON PROYECTO CORRECTO =====
 try {
-    admin.initializeApp();
-    console.log('✅ Firebase Admin inicializado');
+    admin.initializeApp({
+        projectId: 'entradas24december'  // ✅ PROYECTO CORRECTO
+    });
+    console.log('✅ Firebase Admin inicializado: entradas24december');
 } catch (error) {
     if (error.code !== 'app/duplicate-app') {
         console.error('❌ Error inicializando Firebase:', error.message);
@@ -138,9 +140,10 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "23.0.0 - FIRESTORE PERSISTENCE",
+    version: "23.1.0 - FIRESTORE PERSISTENCE (entradas24december)",
     models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL },
-    database: "Firestore ✅"
+    database: "Firestore ✅",
+    project: "entradas24december"
 }));
 
 app.post('/create-store', async (req, res) => {
@@ -154,7 +157,7 @@ app.post('/create-store', async (req, res) => {
             files: []
         });
         
-        console.log(`✅ Store creado en Firestore: ${storeId}`);
+        console.log(`✅ Store creado en Firestore (entradas24december): ${storeId}`);
         res.json({ name: storeId });
     } catch (error) {
         console.error('❌ Error creando store:', error);
@@ -213,7 +216,7 @@ app.post('/link-file', async (req, res) => {
             return res.status(400).json({ error: 'Datos inválidos' });
         }
         
-        console.log(`💾 Guardando ${chunks.length} chunks en Firestore para ${storeId}`);
+        console.log(`💾 Guardando ${chunks.length} chunks en Firestore (entradas24december) para ${storeId}`);
         
         // Referencia al documento del store
         const storeRef = db.collection('stores').doc(storeId);
@@ -253,13 +256,13 @@ app.post('/link-file', async (req, res) => {
                 fileName: chunk.fileName,
                 index: chunk.index || index,
                 embedding: chunk.embedding,
-                createdAt: new Date().toISOString() // ✅ Usar ISO string
+                createdAt: new Date().toISOString()
             });
         });
         
         await batch.commit();
         
-        console.log(`✅ ${chunks.length} chunks guardados en Firestore`);
+        console.log(`✅ ${chunks.length} chunks guardados en Firestore (entradas24december)`);
         
         res.json({ success: true });
     } catch (error) {
@@ -294,7 +297,7 @@ app.post('/chat', async (req, res) => {
             chunks.push(doc.data());
         });
         
-        console.log(`📚 Recuperados ${chunks.length} chunks de Firestore`);
+        console.log(`📚 Recuperados ${chunks.length} chunks de Firestore (entradas24december)`);
         
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
@@ -405,8 +408,8 @@ app.get('/files', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v23.0.0 - FIRESTORE PERSISTENCE`);
+  console.log(`🚀 Backend v23.1.0 - FIRESTORE PERSISTENCE`);
   console.log(`🤖 Modelo: ${CHAT_MODEL}`);
-  console.log(`💾 Base de datos: Firestore`);
+  console.log(`💾 Base de datos: Firestore (entradas24december)`);
   console.log(`✅ Puerto: ${PORT}`);
 });
