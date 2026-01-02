@@ -9,7 +9,7 @@ const admin = require('firebase-admin');
 // ===== INICIALIZAR FIREBASE CON PROYECTO CORRECTO =====
 try {
     admin.initializeApp({
-        projectId: 'entradas24december'
+        projectId: 'entradas24december'  // ✅ PROYECTO CORRECTO
     });
     console.log('✅ Firebase Admin inicializado: entradas24december');
 } catch (error) {
@@ -24,13 +24,9 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const upload = multer({ dest: os.tmpdir() });
 
-// ✅ USAR MODELO MÁS ECONÓMICO PERO EFECTIVO
-const CHAT_MODEL = "gemini-1.5-flash-8b"; // Modelo más económico
+// 🏆 EL MEJOR MODELO - SIN LÍMITES
+const CHAT_MODEL = "gemini-2.5-flash";  // El mejor para RAG
 const EMBEDDING_MODEL = "text-embedding-004";
-
-// Cache simple en memoria para reducir llamadas
-const queryCache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutos
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -105,12 +101,12 @@ async function generateEmbedding(text, apiKey, retries = 3) {
             return result.embedding.values;
         } catch (e) {
             if (e.message.includes('429') && attempt < retries) {
-                console.log(`⏳ Cuota alcanzada, esperando ${2 * attempt}s...`);
+                console.log(`⏳ Reintentando en ${2 * attempt}s...`);
                 await new Promise(r => setTimeout(r, 2000 * attempt));
                 continue;
             }
             if (attempt === retries) {
-                console.error('❌ No se pudo generar embedding después de reintentos');
+                console.error('❌ Error generando embedding:', e.message);
                 return null;
             }
         }
@@ -148,19 +144,14 @@ function keywordScore(query, text) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "24.0.0 - OPTIMIZED (entradas24december)",
+    version: "25.0.0 - PREMIUM (entradas24december)",
     models: { 
-        chat: CHAT_MODEL, 
+        chat: CHAT_MODEL + " 🏆", 
         embedding: EMBEDDING_MODEL 
     },
     database: "Firestore ✅",
     project: "entradas24december",
-    features: [
-        "Cache de queries (5min TTL)",
-        "Modelo económico (gemini-1.5-flash-8b)",
-        "Reintentos automáticos con backoff",
-        "Respuestas acortadas si superan límite"
-    ]
+    mode: "UNLIMITED - Best Performance"
 }));
 
 app.post('/create-store', async (req, res) => {
@@ -206,8 +197,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         for (const chunk of chunks) {
             const embedding = await generateEmbedding(chunk.text, apiKey);
             chunksWithEmbeddings.push({ ...chunk, embedding });
-            // Pausa más larga para evitar cuotas
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 200));
         }
         
         if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -289,18 +279,6 @@ app.post('/chat', async (req, res) => {
         
         console.log(`💬 Pregunta: "${query}" en store: ${storeId}`);
         
-        // Verificar cache
-        const cacheKey = `${storeId}:${query.toLowerCase().trim()}`;
-        if (queryCache.has(cacheKey)) {
-            const cached = queryCache.get(cacheKey);
-            if (Date.now() - cached.timestamp < CACHE_TTL) {
-                console.log('📦 Respuesta desde cache');
-                return res.json(cached.data);
-            } else {
-                queryCache.delete(cacheKey);
-            }
-        }
-        
         // Leer chunks desde Firestore
         const chunksSnapshot = await db.collection('stores')
             .doc(storeId)
@@ -325,8 +303,7 @@ app.post('/chat', async (req, res) => {
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
         if (!queryEmbedding) {
-            // Si no se puede generar embedding, usar solo keywords
-            console.log('⚠️ Usando solo búsqueda por keywords');
+            console.log('⚠️ No se pudo generar embedding, usando solo keywords');
             const scoredChunks = chunks.map(chunk => ({
                 ...chunk,
                 finalScore: keywordScore(query, chunk.text)
@@ -334,20 +311,18 @@ app.post('/chat', async (req, res) => {
             
             const topChunks = scoredChunks
                 .sort((a, b) => b.finalScore - a.finalScore)
-                .slice(0, 3);
+                .slice(0, 5);
             
-            const responseData = {
-                text: "⚠️ Búsqueda limitada por cuota de API. Documentos relevantes:\n\n" +
+            return res.json({
+                text: "⚠️ Búsqueda limitada. Documentos relevantes:\n\n" +
                       topChunks.map((c, i) => 
-                          `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 10).toFixed(0)}%)\n${c.text.substring(0, 200)}...`
-                      ).join('\n\n'),
+                          `${i+1}. **${c.fileName}** (Keywords: ${c.finalScore})`
+                      ).join('\n'),
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
                     score: c.finalScore.toFixed(3)
                 }))
-            };
-            
-            return res.json(responseData);
+            });
         }
         
         const scoredChunks = chunks.map(chunk => {
@@ -355,24 +330,37 @@ app.post('/chat', async (req, res) => {
             const keywordScoreVal = keywordScore(query, chunk.text);
             const finalScore = (semanticScore * 0.7) + (keywordScoreVal * 0.3);
             
-            return { ...chunk, finalScore };
+            return { ...chunk, finalScore, semanticScore };
         });
         
         const topChunks = scoredChunks
             .sort((a, b) => b.finalScore - a.finalScore)
             .slice(0, 5);
         
-        console.log(`🎯 Top 5 chunks: ${topChunks.map(c => c.finalScore.toFixed(3)).join(', ')}`);
+        console.log(`🎯 Top 5 chunks: ${topChunks.map(c => `${c.fileName} (${(c.semanticScore * 100).toFixed(1)}%)`).join(', ')}`);
         
         const context = topChunks
-            .map(c => `[${c.fileName}]\n${c.text}`)
+            .map(c => `[Fuente: ${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
-        // Prompt más corto para ahorrar tokens
-        const prompt = `Contexto:\n${context}\n\nPregunta: ${query}\n\nResponde de forma concisa basándote solo en el contexto:`;
+        const prompt = `Eres un asistente experto que responde preguntas basándose ÚNICAMENTE en el contexto proporcionado.
+
+CONTEXTO DE LOS DOCUMENTOS:
+${context}
+
+PREGUNTA DEL USUARIO: ${query}
+
+INSTRUCCIONES:
+- Responde SOLO con información que aparezca explícitamente en el contexto
+- Si la respuesta no está en el contexto, di claramente: "No encuentro esa información en los documentos"
+- Sé preciso, claro y útil
+- Cita las fuentes relevantes entre paréntesis
+- Si hay múltiples partes relevantes, organiza la información de forma coherente
+
+RESPUESTA:`;
 
         try {
             console.log(`🤖 Llamando a ${CHAT_MODEL}...`);
@@ -380,51 +368,36 @@ app.post('/chat', async (req, res) => {
             const result = await model.generateContent(prompt);
             const answer = result.response.text();
             
-            // Limitar respuesta si es muy larga
-            const maxLength = 1500;
-            const finalAnswer = answer.length > maxLength 
-                ? answer.substring(0, maxLength) + '\n\n... (respuesta acortada por límites)' 
-                : answer;
+            console.log(`✅ Respuesta generada (${answer.length} chars)`);
             
-            console.log(`✅ Respuesta generada: ${finalAnswer.substring(0, 100)}...`);
-            
-            const responseData = {
-                text: finalAnswer,
+            res.json({
+                text: answer,
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
-                    score: c.finalScore.toFixed(3)
+                    score: c.finalScore.toFixed(3),
+                    semanticMatch: `${(c.semanticScore * 100).toFixed(1)}%`
                 }))
-            };
-            
-            // Guardar en cache
-            queryCache.set(cacheKey, {
-                data: responseData,
-                timestamp: Date.now()
             });
-            
-            res.json(responseData);
             
         } catch (error) {
             console.error(`❌ Error con ${CHAT_MODEL}:`, error.message);
             
-            // Respuesta de fallback sin llamar al modelo
-            const fallbackResponse = {
-                text: `Documentos relevantes encontrados:\n\n` +
+            // Fallback: devolver chunks más relevantes
+            res.json({
+                text: `⚠️ Error generando respuesta, pero encontré estos documentos relevantes:\n\n` +
                       topChunks.map((c, i) => 
-                          `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)`
-                      ).join('\n'),
+                          `${i+1}. **${c.fileName}** (Relevancia: ${(c.finalScore * 100).toFixed(0)}%)\n${c.text.substring(0, 300)}...`
+                      ).join('\n\n'),
                 sources: topChunks.map(c => ({
                     fileName: c.fileName,
                     score: c.finalScore.toFixed(3)
                 }))
-            };
-            
-            res.json(fallbackResponse);
+            });
         }
         
     } catch (error) {
         console.error("❌ Error en chat:", error);
-        res.json({ 
+        res.status(500).json({ 
             text: `❌ Error: ${error.message}`,
             sources: []
         });
@@ -459,21 +432,10 @@ app.get('/files', async (req, res) => {
     }
 });
 
-// Limpiar cache cada 10 minutos
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, value] of queryCache.entries()) {
-        if (now - value.timestamp > CACHE_TTL) {
-            queryCache.delete(key);
-        }
-    }
-    console.log(`🧹 Cache limpiado: ${queryCache.size} entradas activas`);
-}, 10 * 60 * 1000);
-
 app.listen(PORT, () => {
-  console.log(`🚀 Backend v24.0.0 - OPTIMIZED`);
-  console.log(`🤖 Modelo: ${CHAT_MODEL} (económico)`);
+  console.log(`🚀 Backend v25.0.0 - PREMIUM MODE`);
+  console.log(`🏆 Modelo: ${CHAT_MODEL} (El mejor)`);
   console.log(`💾 Base de datos: Firestore (entradas24december)`);
-  console.log(`📦 Cache: Activo (5min TTL)`);
+  console.log(`⚡ Sin límites de cuota - Máximo rendimiento`);
   console.log(`✅ Puerto: ${PORT}`);
 });
