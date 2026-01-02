@@ -78,8 +78,7 @@ bot.onText(/\/select/, async (msg) => {
     try {
         bot.sendMessage(msg.chat.id, '🔍 Buscando cerebros disponibles...');
         
-        // Aquí deberías listar cerebros desde Firestore, pero como no tenemos acceso directo,
-        // vamos a usar los IDs que vemos en Firebase
+        // Lista de cerebros - ACTUALIZA ESTO con tus IDs reales de Firebase
         const cerebros = [
             'cerebro_1767052522221',
             'cerebro_1767096461740',
