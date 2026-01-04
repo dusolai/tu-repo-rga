@@ -15,7 +15,7 @@ steps:
       - 'push'
       - 'gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
   
-  # Paso 3: Deploy a Cloud Run
+  # Paso 3: Deploy a Cloud Run usando sustituciones
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -27,11 +27,15 @@ steps:
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--min-instances=1'
-      - '--set-env-vars=TELEGRAM_TOKEN=8405388144:AAFU-FLNKBIWC9sX2pPo3za6sVjGVaVrpZI,BACKEND_URL=https://backend-cerebro-987192214624.europe-southwest1.run.app,GEMINI_API_KEY=AIzaSyDlpnw0gNUQNdbqBARbh1XTuxz9hJJw7JM'
+      - '--set-env-vars=TELEGRAM_TOKEN=${_TELEGRAM_TOKEN},BACKEND_URL=${_BACKEND_URL},GEMINI_API_KEY=${_GEMINI_API_KEY}'
 
 images:
   - 'gcr.io/$PROJECT_ID/telegram-voice-bot:$COMMIT_SHA'
 
-# CONFIGURACIÓN DE LOGS (esto es lo que faltaba)
 options:
   logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _TELEGRAM_TOKEN: "VALOR_POR_DEFECTO_O_VACIO"
+  _BACKEND_URL: "https://backend-cerebro-987192214624.europe-southwest1.run.app"
+  _GEMINI_API_KEY: "VALOR_POR_DEFECTO_O_VACIO"
