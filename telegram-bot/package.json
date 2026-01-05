@@ -1,6 +1,7 @@
 {
   "name": "telegram-voice-bot",
-  "version": "5.0.0",
+  "version": "6.0.0",
+  "description": "Bot de Telegram con voz y memoria",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +10,7 @@
     "express": "^4.19.2",
     "node-telegram-bot-api": "^0.66.0",
     "axios": "^1.6.2",
-    "@google/generative-ai": "^0.21.0"
+    "@google/generative-ai": "^0.21.0",
+    "firebase-admin": "^12.0.0"
   }
 }
