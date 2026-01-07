@@ -175,7 +175,7 @@ async function transcribeAudio(audioPath) {
         const audioBuffer = fs.readFileSync(audioPath);
         const base64Audio = audioBuffer.toString('base64');
         
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
         const result = await model.generateContent([
             { 
