@@ -28,7 +28,7 @@ const BACKEND_URL = process.env.BACKEND_URL;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const SHARED_CEREBRO_ID = 'cerebro_1767296914664';
+const SHARED_CEREBRO_ID = 'cerebro_1767052522221';
 
 // ===== MEMORIA CONVERSACIONAL =====
 const chatHistories = new Map();
