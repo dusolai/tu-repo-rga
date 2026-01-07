@@ -42,10 +42,14 @@ const getApiKey = () => {
   return key;
 };
 
-// ===== CHUNKING =====
-function smartChunk(text, fileName, maxChunkSize = 1000) {
+// ===== CHUNKING CON LÍMITE FIRESTORE =====
+function smartChunk(text, fileName, maxChunkSize = 800) {
     const chunks = [];
     text = text.replace(/\s+/g, ' ').trim();
+    
+    // FIRESTORE LIMIT: 1MB pero usamos 800 chars para seguridad
+    const SAFE_LIMIT = 800;
+    
     const paragraphs = text.split(/\n{2,}|\. {2,}/);
     
     let currentChunk = "";
@@ -54,7 +58,8 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
     for (const para of paragraphs) {
         if (!para.trim()) continue;
         
-        if ((currentChunk + para).length > maxChunkSize && currentChunk.length > 0) {
+        // Si añadir excede límite, guardar chunk actual
+        if ((currentChunk + para).length > SAFE_LIMIT && currentChunk.length > 0) {
             chunks.push({
                 id: `${fileName}_chunk_${chunkIndex}`,
                 text: currentChunk.trim(),
@@ -65,9 +70,35 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
             currentChunk = "";
         }
         
-        currentChunk += para + " ";
+        // Párrafo muy grande, dividirlo palabra por palabra
+        if (para.length > SAFE_LIMIT) {
+            const words = para.split(' ');
+            let tempChunk = "";
+            
+            for (const word of words) {
+                if ((tempChunk + word + " ").length > SAFE_LIMIT) {
+                    if (tempChunk.trim()) {
+                        chunks.push({
+                            id: `${fileName}_chunk_${chunkIndex}`,
+                            text: tempChunk.trim(),
+                            fileName,
+                            index: chunkIndex
+                        });
+                        chunkIndex++;
+                    }
+                    tempChunk = word + " ";
+                } else {
+                    tempChunk += word + " ";
+                }
+            }
+            
+            currentChunk = tempChunk;
+        } else {
+            currentChunk += para + " ";
+        }
         
-        if (currentChunk.length > maxChunkSize) {
+        // Verificar límite
+        if (currentChunk.length > SAFE_LIMIT) {
             chunks.push({
                 id: `${fileName}_chunk_${chunkIndex}`,
                 text: currentChunk.trim(),
@@ -79,6 +110,7 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
         }
     }
     
+    // Último chunk
     if (currentChunk.trim().length > 0) {
         chunks.push({
             id: `${fileName}_chunk_${chunkIndex}`,
@@ -88,6 +120,7 @@ function smartChunk(text, fileName, maxChunkSize = 1000) {
         });
     }
     
+    console.log(`📊 ${chunks.length} chunks (máx ${SAFE_LIMIT} chars)`);
     return chunks;
 }
 
@@ -131,9 +164,10 @@ function cosineSimilarity(vecA, vecB) {
 
 app.get('/', (req, res) => res.json({ 
     status: "Online 🟢",
-    version: "27.0.0 - CEREBRO OPTIMIZADO",
+    version: "28.0.0 - FIRESTORE FIX",
     models: { chat: CHAT_MODEL, embedding: EMBEDDING_MODEL },
-    project: "entradas24december"
+    project: "entradas24december",
+    chunkLimit: 800
 }));
 
 app.post('/create-store', async (req, res) => {
@@ -175,9 +209,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         const chunksWithEmbeddings = [];
         
         for (const chunk of chunks) {
+            // Verificar tamaño antes de procesar
+            if (chunk.text.length > 900) {
+                console.warn(`⚠️ Chunk ${chunk.id} muy grande (${chunk.text.length} chars), truncando...`);
+                chunk.text = chunk.text.substring(0, 800);
+            }
+            
             const embedding = await generateEmbedding(chunk.text, apiKey);
             chunksWithEmbeddings.push({ ...chunk, embedding });
-            await new Promise(r => setTimeout(r, 300)); // Evitar rate limit
+            await new Promise(r => setTimeout(r, 300));
         }
         
         if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -227,20 +267,34 @@ app.post('/link-file', async (req, res) => {
         
         await storeRef.update({ files: filesArray });
         
-        const batch = db.batch();
-        chunks.forEach((chunk, index) => {
-            const chunkRef = storeRef.collection('chunks').doc(`${fileName}_${index}`);
-            batch.set(chunkRef, {
-                text: chunk.text,
-                fileName: chunk.fileName,
-                index: chunk.index || index,
-                embedding: chunk.embedding,
-                createdAt: new Date().toISOString()
+        // Guardar chunks en lotes pequeños
+        const BATCH_SIZE = 10;
+        for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+            const batch = db.batch();
+            const batchChunks = chunks.slice(i, i + BATCH_SIZE);
+            
+            batchChunks.forEach((chunk, index) => {
+                // VERIFICAR TAMAÑO CRÍTICO
+                if (chunk.text && chunk.text.length > 900) {
+                    console.warn(`⚠️ Truncando chunk ${i + index} de ${chunk.text.length} a 800 chars`);
+                    chunk.text = chunk.text.substring(0, 800);
+                }
+                
+                const chunkRef = storeRef.collection('chunks').doc(`${fileName}_${i + index}`);
+                batch.set(chunkRef, {
+                    text: chunk.text,
+                    fileName: chunk.fileName,
+                    index: chunk.index || (i + index),
+                    embedding: chunk.embedding,
+                    createdAt: new Date().toISOString()
+                });
             });
-        });
+            
+            await batch.commit();
+            console.log(`✅ Batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(chunks.length/BATCH_SIZE)}`);
+        }
         
-        await batch.commit();
-        console.log(`✅ Guardado`);
+        console.log(`✅ Guardado completo`);
         res.json({ success: true });
     } catch (error) {
         console.error('❌ Link:', error);
@@ -248,7 +302,6 @@ app.post('/link-file', async (req, res) => {
     }
 });
 
-// ===== CHAT - SIN FALLBACKS INNECESARIOS =====
 app.post('/chat', async (req, res) => {
     try {
         const { storeId, query } = req.body;
@@ -256,7 +309,6 @@ app.post('/chat', async (req, res) => {
         
         console.log(`\n💬 Consulta: "${query}"`);
         
-        // 1. OBTENER CHUNKS
         const chunksSnapshot = await db.collection('stores')
             .doc(storeId)
             .collection('chunks')
@@ -264,7 +316,7 @@ app.post('/chat', async (req, res) => {
         
         if (chunksSnapshot.empty) {
             return res.json({ 
-                text: "⚠️ No hay documentos indexados en este cerebro. Sube archivos primero.",
+                text: "⚠️ No hay documentos indexados en este cerebro.",
                 sources: []
             });
         }
@@ -273,18 +325,13 @@ app.post('/chat', async (req, res) => {
         chunksSnapshot.forEach(doc => chunks.push(doc.data()));
         console.log(`📚 ${chunks.length} chunks disponibles`);
         
-        // 2. GENERAR EMBEDDING DE LA CONSULTA
-        console.log(`🔢 Generando embedding de consulta...`);
         const queryEmbedding = await generateEmbedding(query, apiKey);
         
-        // 3. CALCULAR SIMILITUD
-        console.log(`🎯 Calculando similitudes...`);
         const scoredChunks = chunks.map(chunk => {
             const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
             return { ...chunk, similarity };
         });
         
-        // 4. TOP 5 CHUNKS
         const topChunks = scoredChunks
             .sort((a, b) => b.similarity - a.similarity)
             .slice(0, 5);
@@ -294,37 +341,33 @@ app.post('/chat', async (req, res) => {
             console.log(`  ${i+1}. ${c.fileName} - ${(c.similarity * 100).toFixed(1)}%`);
         });
         
-        // 5. CONSTRUIR CONTEXTO
         const context = topChunks
             .map(c => `[Documento: ${c.fileName}]\n${c.text}`)
             .join('\n\n---\n\n');
         
-        // 6. PROMPT OPTIMIZADO
-        const prompt = `Eres Cerebro Diego, un asistente experto que responde preguntas basándose ÚNICAMENTE en documentos.
+        const prompt = `Eres Cerebro Diego, un asistente experto que responde basándose ÚNICAMENTE en documentos.
 
-**REGLAS ESTRICTAS:**
-1. Responde SOLO con información que aparece en el contexto
-2. Si la info no está, di: "No encuentro esa información en los documentos"
-3. Sé directo y útil, sin rodeos
-4. NO inventes ni supongas nada
-5. Cita las fuentes relevantes
+**REGLAS:**
+1. Responde SOLO con info del contexto
+2. Si no está, di: "No encuentro esa información"
+3. Sé directo y útil
+4. NO inventes nada
+5. Cita fuentes relevantes
 
-**CONTEXTO DE LOS DOCUMENTOS:**
+**CONTEXTO:**
 ${context}
 
 **PREGUNTA:** ${query}
 
-**TU RESPUESTA (directa y basada en los documentos):**`;
+**RESPUESTA:**`;
 
-        // 7. GENERAR RESPUESTA
-        console.log(`🤖 Generando respuesta con ${CHAT_MODEL}...`);
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: CHAT_MODEL });
         
         const result = await model.generateContent(prompt);
         const answer = result.response.text();
         
-        console.log(`✅ Respuesta generada (${answer.length} chars)\n`);
+        console.log(`✅ Respuesta (${answer.length} chars)\n`);
         
         res.json({
             text: answer,
@@ -336,10 +379,8 @@ ${context}
         
     } catch (error) {
         console.error("❌ Error en chat:", error.message);
-        
-        // SOLO EN CASO DE ERROR CRÍTICO
         res.status(500).json({ 
-            text: `❌ Error procesando tu consulta: ${error.message}\n\nIntenta de nuevo en unos segundos.`,
+            text: `❌ Error: ${error.message}`,
             sources: []
         });
     }
@@ -373,8 +414,9 @@ app.get('/files', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 Cerebro Diego Backend v27.0.0`);
+  console.log(`\n🚀 Cerebro Diego Backend v28.0.0`);
   console.log(`🤖 Modelo: ${CHAT_MODEL}`);
   console.log(`💾 Firebase: entradas24december`);
+  console.log(`📏 Chunk limit: 800 chars (Firestore safe)`);
   console.log(`✅ Puerto: ${PORT}\n`);
 });
